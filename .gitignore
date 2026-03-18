@@ -1,0 +1,9 @@
+node_modules/
+log/
+install/
+build/
+.kiro/
+ros2-react-app/package-lock.json
+__pycache__/
+*.pyc
+.env

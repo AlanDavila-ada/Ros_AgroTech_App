@@ -1,0 +1,14 @@
+[project]
+name = "agrotech_sim"
+version = "0.1.0"
+description = "Simulated sensor nodes for AgroTech"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+dependencies = ["rclpy", "sensor_msgs", "std_msgs"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[project.scripts]
+imu_sim = "agrotech_sim.imu_sim:main"
