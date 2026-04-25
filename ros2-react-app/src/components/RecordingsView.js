@@ -1,45 +1,69 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import ROSLIB from 'roslib';
+import { rosEnv } from '../rosEnv';
 
 const SSH_URL = 'http://localhost:4500';
 const sshExec = async (host, cmd) => {
   const r = await fetch(`${SSH_URL}/ssh/exec`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ host, user: 'hec', password: 'h3ll0', command: cmd }),
+    body: JSON.stringify({ host, user: 'ada', password: 'ada123', command: cmd }),
   });
   return r.json();
 };
 
-const PLAYBACK_TOPICS = [
-  { key: 'cam0_raw', topic: '/playback/cam0/raw/compressed', label: 'Cam0 Raw' },
-  { key: 'cam0_proc', topic: '/playback/cam0/processed/compressed', label: 'Cam0 Processed' },
-  { key: 'cam1_raw', topic: '/playback/cam1/raw/compressed', label: 'Cam1 Raw' },
-  { key: 'cam1_proc', topic: '/playback/cam1/processed/compressed', label: 'Cam1 Processed' },
-];
+const TOPIC_MAP = {
+  '/jetson/cam0/image_raw/compressed': '/playback/cam0/raw/compressed',
+  '/jetson/cam1/image_raw/compressed': '/playback/cam1/raw/compressed',
+  '/jetson/cam0/image_undistorted/compressed': '/playback/cam0/processed/compressed',
+  '/jetson/cam1/image_undistorted/compressed': '/playback/cam1/processed/compressed',
+};
 
-/* ── Playback viewer (single ROS connection, 4 subs) ── */
-const PlaybackViewer = ({ jetsonHost, active, onConnected }) => {
-  const [srcs, setSrcs] = useState({});
+const IMAGE_TYPES = ['sensor_msgs/msg/CompressedImage', 'sensor_msgs/msg/Image'];
+const ROS_TYPE_MAP = {
+  'sensor_msgs/msg/CompressedImage': 'sensor_msgs/CompressedImage',
+  'sensor_msgs/msg/Image': 'sensor_msgs/Image',
+  'nav_msgs/msg/Odometry': 'nav_msgs/Odometry',
+  'sensor_msgs/msg/JointState': 'sensor_msgs/JointState',
+  'sensor_msgs/msg/Imu': 'sensor_msgs/Imu',
+  'std_msgs/msg/String': 'std_msgs/String',
+  'geometry_msgs/msg/Twist': 'geometry_msgs/Twist',
+};
+
+/* ── Playback viewer ── */
+const PlaybackViewer = ({ jetsonHost, active, onConnected, topics }) => {
+  const [imgSrcs, setImgSrcs] = useState({});
+  const [dataValues, setDataValues] = useState({});
   const urlRefs = useRef({});
   const rosRef = useRef(null);
   const subsRef = useRef([]);
 
+  const topicEntries = Object.entries(topics || {}).filter(([, info]) => (info.frames || 0) > 0);
+  const imageTopics = topicEntries.filter(([, info]) => IMAGE_TYPES.includes(info.type));
+  const dataTopics = topicEntries.filter(([, info]) => !IMAGE_TYPES.includes(info.type));
+
   useEffect(() => {
-    if (!active) return;
+    if (!active || topicEntries.length === 0) return;
     const ros = new ROSLIB.Ros({ url: `ws://${jetsonHost}:9090` });
     ros.on('error', () => {});
     rosRef.current = ros;
 
     ros.on('connection', () => {
-      const subs = PLAYBACK_TOPICS.map(({ key, topic }) => {
-        const sub = new ROSLIB.Topic({ ros, name: topic, messageType: 'sensor_msgs/CompressedImage' });
+      const subs = topicEntries.map(([origTopic, info]) => {
+        const pbTopic = TOPIC_MAP[origTopic] || ('/playback' + origTopic);
+        const rosType = ROS_TYPE_MAP[info.type] || info.type.replace('/msg/', '/');
+        const isImage = IMAGE_TYPES.includes(info.type);
+        const sub = new ROSLIB.Topic({ ros, name: pbTopic, messageType: rosType });
         sub.subscribe((msg) => {
-          const raw = atob(msg.data);
-          const arr = new Uint8Array(raw.length);
-          for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
-          if (urlRefs.current[key]) URL.revokeObjectURL(urlRefs.current[key]);
-          urlRefs.current[key] = URL.createObjectURL(new Blob([arr], { type: 'image/jpeg' }));
-          setSrcs((prev) => ({ ...prev, [key]: urlRefs.current[key] }));
+          if (isImage && msg.data) {
+            const raw = atob(msg.data);
+            const arr = new Uint8Array(raw.length);
+            for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+            if (urlRefs.current[origTopic]) URL.revokeObjectURL(urlRefs.current[origTopic]);
+            urlRefs.current[origTopic] = URL.createObjectURL(new Blob([arr], { type: 'image/jpeg' }));
+            setImgSrcs((prev) => ({ ...prev, [origTopic]: urlRefs.current[origTopic] }));
+          } else {
+            setDataValues((prev) => ({ ...prev, [origTopic]: msg }));
+          }
         });
         return sub;
       });
@@ -52,37 +76,71 @@ const PlaybackViewer = ({ jetsonHost, active, onConnected }) => {
       Object.values(urlRefs.current).forEach((u) => URL.revokeObjectURL(u));
       urlRefs.current = {};
       if (rosRef.current) rosRef.current.close();
-      setSrcs({});
+      setImgSrcs({});
+      setDataValues({});
     };
-  }, [jetsonHost, active]);
+  }, [jetsonHost, active, topicEntries.length]);
+
+  const shortName = (t) => t.split('/').filter(Boolean).slice(-2).join('/');
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-      {[['cam0', 'Camera 0', 'cam0_raw', 'cam0_proc'], ['cam1', 'Camera 1', 'cam1_raw', 'cam1_proc']].map(([id, title, rawK, procK]) => (
-        <div key={id}>
-          <div style={{ fontSize: 13, fontWeight: 700, color: '#e0e0e6', marginBottom: 6 }}>{title}</div>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-            {[[rawK, 'Raw'], [procK, 'Processed']].map(([k, lbl]) => (
-              <div key={k} style={cs.card}>
-                <div style={cs.header}>{lbl}</div>
-                {srcs[k] ? <img src={srcs[k]} alt={lbl} style={cs.img} /> : <div style={cs.ph}>Waiting...</div>}
-              </div>
-            ))}
-          </div>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+      {imageTopics.length > 0 && (
+        <div style={{ display: 'grid', gridTemplateColumns: `repeat(${Math.min(imageTopics.length, 4)}, 1fr)`, gap: 10 }}>
+          {imageTopics.map(([topic]) => (
+            <div key={topic} style={cs.card}>
+              <div style={cs.header}>{shortName(topic)}</div>
+              {imgSrcs[topic] ? <img src={imgSrcs[topic]} alt={topic} style={cs.img} /> : <div style={cs.ph}>Waiting...</div>}
+            </div>
+          ))}
         </div>
-      ))}
+      )}
+      {dataTopics.length > 0 && (
+        <div style={{ display: 'grid', gridTemplateColumns: `repeat(${Math.min(dataTopics.length, 3)}, 1fr)`, gap: 10 }}>
+          {dataTopics.map(([topic, info]) => (
+            <div key={topic} style={cs.card}>
+              <div style={cs.header}>{shortName(topic)} <span style={{ color: '#555', fontWeight: 400 }}>({info.type.split('/').pop()})</span></div>
+              <pre style={cs.dataBox}>{dataValues[topic] ? JSON.stringify(dataValues[topic], null, 1) : 'Waiting...'}</pre>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 };
 
-export const RecordingsView = ({ jetsonHost }) => {
+/* ── Scan script: supports both old (patrol/rec) and new (company/device/patrol/rec) structures ── */
+const SCAN_SCRIPT = `python3 -c "
+import os,json
+base='/AgroTech_recordings'
+out=[]
+def scan(d, parts):
+  mf=os.path.join(d,'metadata.json')
+  if os.path.isfile(mf):
+    with open(mf) as f: m=json.load(f)
+    if len(parts)==4:
+      out.append({'company':parts[0],'device':parts[1],'patrol':parts[2],'recording':parts[3],'meta':m})
+    elif len(parts)==2:
+      out.append({'company':'','device':'','patrol':parts[0],'recording':parts[1],'meta':m})
+    return
+  if len(parts)>=4: return
+  try: entries=sorted(os.listdir(d))
+  except: return
+  for e in entries:
+    ep=os.path.join(d,e)
+    if os.path.isdir(ep): scan(ep, parts+[e])
+scan(base,[])
+print(json.dumps(out))
+"`;
+
+export const RecordingsView = ({ jetsonHost, domainId }) => {
   const [recordings, setRecordings] = useState([]);
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState(null);
   const [playing, setPlaying] = useState(false);
   const [playPct, setPlayPct] = useState(0);
   const [speed, setSpeed] = useState(1);
-  const [expanded, setExpanded] = useState(null); // patrol/recording key for file tree
+  const [expanded, setExpanded] = useState(null);
   const [fileTree, setFileTree] = useState(null);
   const [fileTreeLoading, setFileTreeLoading] = useState(false);
   const pollRef = useRef(null);
@@ -91,22 +149,7 @@ export const RecordingsView = ({ jetsonHost }) => {
   const loadRecordings = useCallback(async () => {
     setLoading(true);
     try {
-      const d = await sshExec(jetsonHost,
-        `python3 -c "
-import os,json
-base='/AgroTech_recordings'
-out=[]
-for p in sorted(os.listdir(base)):
- pp=os.path.join(base,p)
- if not os.path.isdir(pp): continue
- for r in sorted(os.listdir(pp)):
-  mf=os.path.join(pp,r,'metadata.json')
-  if os.path.isfile(mf):
-   with open(mf) as f: m=json.load(f)
-   out.append({'patrol':p,'recording':r,'meta':m})
-print(json.dumps(out))
-"`
-      );
+      const d = await sshExec(jetsonHost, SCAN_SCRIPT);
       if (d.ok && d.output) {
         try { setRecordings(JSON.parse(d.output.trim())); } catch {}
       }
@@ -116,16 +159,23 @@ print(json.dumps(out))
 
   useEffect(() => { loadRecordings(); }, [loadRecordings]);
 
+  const recPath = (rec) => rec.company
+    ? `${rec.company}/${rec.device}/${rec.patrol}/${rec.recording}`
+    : `${rec.patrol}/${rec.recording}`;
+
+  const recKey = (rec) => recPath(rec);
+
   const loadFileTree = async (rec) => {
-    const key = `${rec.patrol}/${rec.recording}`;
+    const key = recKey(rec);
     if (expanded === key) { setExpanded(null); setFileTree(null); return; }
     setExpanded(key);
     setFileTreeLoading(true);
+    const rp = recPath(rec);
     try {
       const d = await sshExec(jetsonHost,
         `python3 -c "
 import os,json
-base='/AgroTech_recordings/${rec.patrol}/${rec.recording}'
+base='/AgroTech_recordings/${rp}'
 tree=[]
 for root,dirs,files in os.walk(base):
  for f in sorted(files):
@@ -144,10 +194,9 @@ print(json.dumps(tree))
   };
 
   const downloadFile = async (rec, relPath) => {
+    const rp = recPath(rec);
     try {
-      const d = await sshExec(jetsonHost,
-        `base64 /AgroTech_recordings/${rec.patrol}/${rec.recording}/${relPath}`
-      );
+      const d = await sshExec(jetsonHost, `base64 /AgroTech_recordings/${rp}/${relPath}`);
       if (d.ok && d.output) {
         const raw = atob(d.output.trim());
         const arr = new Uint8Array(raw.length);
@@ -172,18 +221,16 @@ print(json.dumps(tree))
     setPlaying(true);
     setPlayPct(0);
     offsetRef.current = 0;
-    // Wait for PlaybackViewer ROSLIB to connect
     await new Promise((resolve) => { viewerReadyRef.current = resolve; });
     try {
       await fetch(`${SSH_URL}/ssh/launch`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          id: 'mcap_player', host: jetsonHost, user: 'hec', password: 'h3ll0',
-          command: `source /opt/ros/humble/setup.bash && python3 /home/hec/mcap_player.py --patrol "${rec.patrol}" --recording "${rec.recording}" --speed ${speed}`,
+          id: 'mcap_player', host: jetsonHost, user: 'ada', password: 'ada123',
+          command: `${rosEnv(domainId)} && python3 /home/ada/mcap_player.py --path /AgroTech_recordings/${recPath(rec)} --speed ${speed}`,
         }),
       });
     } catch {}
-    // Poll progress
     pollRef.current = setInterval(async () => {
       try {
         const r = await fetch(`${SSH_URL}/ssh/output`, {
@@ -207,11 +254,19 @@ print(json.dumps(tree))
 
   const stopPlayback = async () => {
     clearInterval(pollRef.current);
-    try { await fetch(`${SSH_URL}/ssh/stop`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: 'mcap_player', host: jetsonHost, user: 'hec', password: 'h3ll0', command: 'python3 /home/hec/mcap_player.py' }) }); } catch {}
+    try { await fetch(`${SSH_URL}/ssh/stop`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: 'mcap_player', host: jetsonHost, user: 'ada', password: 'ada123', command: 'python3 /home/ada/mcap_player.py' }) }); } catch {}
     setPlaying(false);
   };
 
   useEffect(() => () => clearInterval(pollRef.current), []);
+
+  // Group recordings by company/device
+  const grouped = {};
+  recordings.forEach((rec) => {
+    const group = rec.company ? `${rec.company} / ${rec.device}` : 'Legacy';
+    if (!grouped[group]) grouped[group] = [];
+    grouped[group].push(rec);
+  });
 
   return (
     <main style={st.main}>
@@ -220,63 +275,68 @@ print(json.dumps(tree))
         <button style={st.refreshBtn} onClick={loadRecordings} disabled={loading}>{loading ? '...' : '↻ Refresh'}</button>
       </div>
 
-      {/* Recording list */}
       {recordings.length === 0 && !loading && <div style={st.empty}>No recordings found in /AgroTech_recordings/</div>}
-      <div style={st.list}>
-        {recordings.map((rec) => {
-          const m = rec.meta;
-          const active = selected?.patrol === rec.patrol && selected?.recording === rec.recording;
-          const totalFrames = Object.values(m.topics || {}).reduce((a, t) => a + (t.frames || 0), 0);
-          return (
-            <div key={`${rec.patrol}/${rec.recording}`} style={{ ...st.recCard, borderColor: active ? '#6c5ce7' : '#1e1e2a' }}>
-              <div style={st.recHeader}>
-                <div>
-                  <div style={st.recTitle}>{rec.patrol} / {rec.recording}</div>
-                  <div style={st.recMeta}>{m.start_time} — {m.duration_sec}s — {totalFrames} frames</div>
-                </div>
-                <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                  <button style={st.browseBtn} onClick={() => loadFileTree(rec)}>
-                    {expanded === `${rec.patrol}/${rec.recording}` ? '📁 Hide' : '📁 Files'}
-                  </button>
-                  {active && playing
-                    ? <button style={st.stopBtn} onClick={stopPlayback}>⏹ Stop</button>
-                    : <button style={st.playBtn} onClick={() => startPlayback(rec)} disabled={playing}>▶ Play</button>
-                  }
-                </div>
-              </div>
-              {/* Topics */}
-              <div style={st.topicList}>
-                {Object.entries(m.topics || {}).map(([t, info]) => (
-                  <span key={t} style={st.topicTag}>{t.split('/').pop()} ({info.frames})</span>
-                ))}
-              </div>
-              {m.calibration_profile && (
-                <div style={{ marginTop: 6 }}>
-                  {Object.entries(m.calibration_profile).map(([cid, c]) => (
-                    <span key={cid} style={{ ...st.topicTag, borderColor: '#6c5ce733', color: '#6c5ce7' }}>📐 {cid}: fx={c.fx} fy={c.fy}</span>
-                  ))}
-                </div>
-              )}
-              {m.pose_match_id && <div style={st.recMeta}>Pose match: {m.pose_match_id}</div>}
 
-              {/* File tree */}
-              {expanded === `${rec.patrol}/${rec.recording}` && (
-                <div style={st.fileTree}>
-                  {fileTreeLoading ? <div style={{ color: '#555', fontSize: 11 }}>Loading...</div> :
-                   !fileTree || fileTree.length === 0 ? <div style={{ color: '#555', fontSize: 11 }}>No files</div> :
-                   fileTree.map((f) => (
-                    <div key={f.path} style={st.fileRow}>
-                      <span style={st.filePath}>{f.path}</span>
-                      <span style={st.fileSize}>{fmtSize(f.size)}</span>
-                      <button style={st.dlBtn} onClick={() => downloadFile(rec, f.path)}>↓</button>
+      {Object.entries(grouped).map(([group, recs]) => (
+        <div key={group}>
+          <div style={st.groupHeader}>{group}</div>
+          <div style={st.list}>
+            {recs.map((rec) => {
+              const m = rec.meta;
+              const key = recKey(rec);
+              const active = selected && recKey(selected) === key;
+              const totalFrames = Object.values(m.topics || {}).reduce((a, t) => a + (t.frames || 0), 0);
+              const hasCamerasMcap = fileTree && expanded === key && fileTree.some(f => f.path === 'cameras.mcap');
+              return (
+                <div key={key} style={{ ...st.recCard, borderColor: active ? '#6c5ce7' : '#1e1e2a' }}>
+                  <div style={st.recHeader}>
+                    <div>
+                      <div style={st.recTitle}>{rec.patrol} / {rec.recording}</div>
+                      <div style={st.recMeta}>{m.start_time} — {m.duration_sec}s — {totalFrames} frames</div>
                     </div>
-                  ))}
+                    <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                      <button style={st.browseBtn} onClick={() => loadFileTree(rec)}>
+                        {expanded === key ? '📁 Hide' : '📁 Files'}
+                      </button>
+                      {active && playing
+                        ? <button style={st.stopBtn} onClick={stopPlayback}>⏹ Stop</button>
+                        : <button style={st.playBtn} onClick={() => startPlayback(rec)} disabled={playing}>▶ Play</button>
+                      }
+                    </div>
+                  </div>
+                  <div style={st.topicList}>
+                    {Object.entries(m.topics || {}).map(([t, info]) => (
+                      <span key={t} style={st.topicTag}>{t.split('/').pop()} ({info.frames})</span>
+                    ))}
+                  </div>
+                  {m.calibration_profile && (
+                    <div style={{ marginTop: 6 }}>
+                      {Object.entries(m.calibration_profile).map(([cid, c]) => (
+                        <span key={cid} style={{ ...st.topicTag, borderColor: '#6c5ce733', color: '#6c5ce7' }}>📐 {cid}: fx={c.fx} fy={c.fy}</span>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* File tree */}
+                  {expanded === key && (
+                    <div style={st.fileTree}>
+                      {fileTreeLoading ? <div style={{ color: '#555', fontSize: 11 }}>Loading...</div> :
+                       !fileTree || fileTree.length === 0 ? <div style={{ color: '#555', fontSize: 11 }}>No files</div> :
+                       fileTree.map((f) => (
+                        <div key={f.path} style={st.fileRow}>
+                          <span style={st.filePath}>{f.path}</span>
+                          <span style={st.fileSize}>{fmtSize(f.size)}</span>
+                          <button style={st.dlBtn} onClick={() => downloadFile(rec, f.path)}>↓</button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
-              )}
-            </div>
-          );
-        })}
-      </div>
+              );
+            })}
+          </div>
+        </div>
+      ))}
 
       {/* Speed control */}
       <div style={st.controls}>
@@ -297,8 +357,7 @@ print(json.dumps(tree))
         </div>
       )}
 
-      {/* Playback streams */}
-      {selected && playing && <PlaybackViewer jetsonHost={jetsonHost} active={playing} onConnected={() => { if (viewerReadyRef.current) { viewerReadyRef.current(); viewerReadyRef.current = null; } }} />}
+      {selected && playing && <PlaybackViewer jetsonHost={jetsonHost} active={playing} topics={selected.meta.topics} onConnected={() => { if (viewerReadyRef.current) { viewerReadyRef.current(); viewerReadyRef.current = null; } }} />}
     </main>
   );
 };
@@ -308,6 +367,7 @@ const cs = {
   header: { padding: '8px 12px', fontSize: 11, fontWeight: 600, borderBottom: '1px solid #1e1e2a', color: '#aaa' },
   img: { width: '100%', display: 'block' },
   ph: { padding: 30, textAlign: 'center', color: '#444', fontSize: 11 },
+  dataBox: { margin: 0, padding: 10, fontSize: 10, color: '#8f8', fontFamily: "'JetBrains Mono', monospace", background: '#0a0a0f', maxHeight: 140, overflow: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-all' },
 };
 
 const st = {
@@ -316,7 +376,8 @@ const st = {
   title: { fontSize: 18, fontWeight: 700, color: '#e0e0e6' },
   refreshBtn: { padding: '6px 14px', background: '#1a1a24', border: '1px solid #2a2a3a', borderRadius: 8, color: '#888', fontSize: 11, cursor: 'pointer', fontWeight: 600 },
   empty: { padding: 40, textAlign: 'center', color: '#555', fontSize: 13 },
-  list: { display: 'flex', flexDirection: 'column', gap: 10 },
+  groupHeader: { fontSize: 12, fontWeight: 700, color: '#6c5ce7', letterSpacing: '0.5px', padding: '8px 0 4px', borderBottom: '1px solid #1e1e2a', marginBottom: 8 },
+  list: { display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 16 },
   recCard: { background: '#111118', border: '1px solid #1e1e2a', borderRadius: 12, padding: 14 },
   recHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' },
   recTitle: { fontSize: 14, fontWeight: 700, color: '#e0e0e6' },

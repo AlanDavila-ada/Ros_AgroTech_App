@@ -3,6 +3,7 @@ import { useState, useEffect } from 'react';
 export const Sidebar = ({
   ros, connected, view, onViewChange,
   jetsonHost, onJetsonHostChange, jetsonPort, onJetsonPortChange,
+  domainId, onDomainIdChange,
   localConnected, jetsonConnected,
 }) => {
   const [collapsed, setCollapsed] = useState(false);
@@ -42,6 +43,10 @@ export const Sidebar = ({
         <div style={st.connFields}>
           <input style={st.connInput} value={jetsonHost} onChange={(e) => onJetsonHostChange(e.target.value)} placeholder="Jetson IP" />
           <input style={{ ...st.connInput, width: 60, flexShrink: 0 }} value={jetsonPort} onChange={(e) => onJetsonPortChange(e.target.value)} placeholder="Port" />
+        </div>
+        <div style={{ ...st.connFields, marginTop: 2 }}>
+          <span style={{ fontSize: 10, color: '#555', width: 68, flexShrink: 0 }}>Domain ID</span>
+          <input style={{ ...st.connInput, width: 60, flexShrink: 0 }} value={domainId} onChange={(e) => onDomainIdChange(e.target.value)} placeholder="42" />
         </div>
       </div>
 

@@ -25,7 +25,7 @@ export const JetsonUpload = ({ jetsonHost }) => {
     try {
       const r = await fetch(`${SSH_URL}/ssh/exec`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ host: jetsonHost, user: 'hec', password: 'h3ll0',
+        body: JSON.stringify({ host: jetsonHost, user: 'ada', password: 'ada123',
           command: `python3 -c "
 import os,json
 base='/AgroTech_recordings'
@@ -59,7 +59,7 @@ print(json.dumps(out))
       await fetch(`${SSH_URL}/s3/upload`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          host: jetsonHost, user: 'hec', password: 'h3ll0',
+          host: jetsonHost, user: 'ada', password: 'ada123',
           patrol: rec.patrol, recording: rec.recording,
           bucket: creds.bucket, prefix: creds.prefix || '', region: creds.region,
           accessKeyId: creds.accessKeyId, secretAccessKey: creds.secretAccessKey,

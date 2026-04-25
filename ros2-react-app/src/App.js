@@ -5,8 +5,9 @@ import { LocalView } from './components/LocalView';
 import { JetsonView } from './components/JetsonView';
 
 function App() {
-  const [jetsonHost, setJetsonHost] = useState('192.168.15.147');
+  const [jetsonHost, setJetsonHost] = useState('192.168.15.173');
   const [jetsonPort, setJetsonPort] = useState('9090');
+  const [domainId, setDomainId] = useState('42');
 
   const { ros: localRos, connected: localConnected } = useRos('ws://localhost:9090');
   const { ros: jetsonRos, connected: jetsonConnected } = useRos(`ws://${jetsonHost}:${jetsonPort}`);
@@ -30,6 +31,8 @@ function App() {
         onJetsonHostChange={setJetsonHost}
         jetsonPort={jetsonPort}
         onJetsonPortChange={setJetsonPort}
+        domainId={domainId}
+        onDomainIdChange={setDomainId}
         localConnected={localConnected}
         jetsonConnected={jetsonConnected}
       />
@@ -49,7 +52,7 @@ function App() {
           </div>
         </div>
         {view === 'jetson' ? (
-          <JetsonView ros={jetsonRos} connected={jetsonConnected} jetsonHost={jetsonHost} />
+          <JetsonView ros={jetsonRos} connected={jetsonConnected} jetsonHost={jetsonHost} domainId={domainId} />
         ) : (
           <LocalView
             ros={localRos}

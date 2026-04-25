@@ -1,11 +1,12 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import ROSLIB from 'roslib';
+import { rosEnv } from '../rosEnv';
 
 const SSH_URL = 'http://localhost:4500';
-const sshExec = async (host, cmd) => {
+const sshExec = async (host, cmd, domainId) => {
   const r = await fetch(`${SSH_URL}/ssh/exec`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ host, user: 'hec', password: 'h3ll0', command: `source /opt/ros/humble/setup.bash && ${cmd}` }),
+    body: JSON.stringify({ host, user: 'ada', password: 'ada123', command: `${rosEnv(domainId)} && ${cmd}` }),
   });
   return r.json();
 };
@@ -72,7 +73,7 @@ const CalibPreview = ({ camIds, jetsonHost, progress, target, calibrating, ros }
   );
 };
 
-export const CalibrationPanel = ({ jetsonHost, onProfileActivated }) => {
+export const CalibrationPanel = ({ jetsonHost, onProfileActivated, domainId }) => {
   const [open, setOpen] = useState(true);
   const [tab, setTab] = useState('profiles'); // 'profiles' | 'new'
   const [profiles, setProfiles] = useState([]);
@@ -100,7 +101,7 @@ export const CalibrationPanel = ({ jetsonHost, onProfileActivated }) => {
   const loadProfiles = useCallback(async () => {
     setLoading(true);
     try {
-      const d = await sshExec(jetsonHost, 'python3 /home/hec/calibrate_headless.py --list-profiles');
+      const d = await sshExec(jetsonHost, 'python3 /home/ada/calibrate_headless.py --list-profiles', domainId);
       if (d.ok && d.output) {
         const lines = d.output.trim().split('\n');
         for (const l of lines) {
@@ -117,13 +118,13 @@ export const CalibrationPanel = ({ jetsonHost, onProfileActivated }) => {
   useEffect(() => { if (open) loadProfiles(); }, [open, loadProfiles]);
 
   const activateProfile = async (name) => {
-    await sshExec(jetsonHost, `python3 /home/hec/calibrate_headless.py --activate-profile "${name}"`);
+    await sshExec(jetsonHost, `python3 /home/ada/calibrate_headless.py --activate-profile "${name}"`, domainId);
     await loadProfiles();
     if (onProfileActivated) onProfileActivated(name);
   };
 
   const deleteProfile = async (name) => {
-    await sshExec(jetsonHost, `python3 /home/hec/calibrate_headless.py --delete-profile "${name}"`);
+    await sshExec(jetsonHost, `python3 /home/ada/calibrate_headless.py --delete-profile "${name}"`, domainId);
     await loadProfiles();
   };
 
@@ -131,12 +132,12 @@ export const CalibrationPanel = ({ jetsonHost, onProfileActivated }) => {
     if (!profileName.trim()) return;
     setRunning(true); setCalibrating(false); setLogs([]); setProgress({}); setResult(null); offsetRef.current = 0;
     const typeFlag = camType !== 'normal' ? ` --type ${camType}` : '';
-    const cmd = `python3 /home/hec/calibrate_headless.py --target ${target} --camera ${camera}${typeFlag} --profile "${profileName}" --description "${description}"`;
+    const cmd = `python3 /home/ada/calibrate_headless.py --target ${target} --camera ${camera}${typeFlag} --profile "${profileName}" --description "${description}"`;
     try {
       const res = await fetch(`${SSH_URL}/ssh/launch`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: 'calibration', host: jetsonHost, user: 'hec', password: 'h3ll0',
-          command: `source /opt/ros/humble/setup.bash && ${cmd}` }),
+        body: JSON.stringify({ id: 'calibration', host: jetsonHost, user: 'ada', password: 'ada123',
+          command: `${rosEnv(domainId)} && ${cmd} 2>/dev/null` }),
       });
       const data = await res.json();
       if (!data.ok) { setLogs([{ stage: 'error', message: data.error }]); setRunning(false); return; }

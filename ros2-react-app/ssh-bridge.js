@@ -1,12 +1,26 @@
 const http = require('http');
 const { Client } = require('ssh2');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
-const { Readable } = require('stream');
 
 process.on('uncaughtException', (err) => console.error('Uncaught:', err.message));
 process.on('unhandledRejection', (err) => console.error('Unhandled:', err));
 
-const sessions = {}; // keyed by id
+const sessions = {}; // track launched session metadata
+
+const sshRun = (host, user, password, command) => new Promise((resolve, reject) => {
+  const conn = new Client();
+  conn.on('ready', () => {
+    conn.exec(command, (err, stream) => {
+      if (err) { conn.end(); return reject(err); }
+      let out = '';
+      stream.on('data', (d) => (out += d.toString()));
+      stream.stderr.on('data', (d) => (out += d.toString()));
+      stream.on('close', () => { conn.end(); resolve(out); });
+    });
+  });
+  conn.on('error', reject);
+  conn.connect({ host, port: 22, username: user, password, keepaliveInterval: 10000 });
+});
 
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -21,108 +35,73 @@ const server = http.createServer((req, res) => {
 
     if (req.url === '/ssh/launch' && req.method === 'POST') {
       const { id, host, user, password, command } = JSON.parse(body);
-      // Check bridge session
-      if (sessions[id] && !sessions[id].done) {
-        json({ ok: false, error: `Session "${id}" already running. Stop first.` }); return;
-      }
-      // Check if process is already running on remote
-      const procName = command.split('&&').pop().trim().split(/\s+/).slice(0, 2).join(' ');
-      const chkConn = new Client();
-      chkConn.on('ready', () => {
-        chkConn.exec(`ps aux | grep "${procName}" | grep -v grep | grep -v pgrep | grep -v pkill > /dev/null 2>&1 && echo ALIVE || echo DEAD`, (err, stream) => {
-          let out = '';
-          if (err) { chkConn.end(); doLaunch(); return; }
-          stream.on('data', (d) => (out += d.toString()));
-          stream.on('close', () => {
-            chkConn.end();
-            if (out.trim() === 'ALIVE') {
-              json({ ok: false, error: `Process already running on remote. Stop first.` });
-            } else {
-              // Clean stale session if exists
-              if (sessions[id]) delete sessions[id];
-              doLaunch();
-            }
-          });
-        });
-      });
-      chkConn.on('error', () => doLaunch());
-      chkConn.connect({ host, port: 22, username: user, password });
 
-      function doLaunch() {
-        const conn = new Client();
-        conn.on('ready', () => {
-          conn.exec(command, (err, stream) => {
-            if (err) { json({ ok: false, error: err.message }); conn.end(); return; }
-            const output = [];
-            sessions[id] = { conn, stream, output, done: false, host, user, password, command };
-            stream.on('data', (d) => output.push(d.toString()));
-            stream.stderr.on('data', (d) => output.push(d.toString()));
-            stream.on('close', () => { if (sessions[id]) sessions[id].done = true; });
+      // Check if tmux session already exists
+      sshRun(host, user, password, `tmux has-session -t ${id} 2>/dev/null && echo ALIVE || echo DEAD`)
+        .then((out) => {
+          if (out.trim() === 'ALIVE') {
+            json({ ok: false, error: `Session "${id}" already running. Stop first.` });
+            return;
+          }
+          // Launch in tmux session with log file
+          const logFile = `/tmp/agrotech_${id}.log`;
+          const escaped = command.replace(/"/g, '\\"');
+          const tmuxCmd = `rm -f ${logFile} && tmux new-session -d -s ${id} "${escaped}"` +
+            ` && tmux pipe-pane -t ${id} 'cat >> ${logFile}'`;
+          return sshRun(host, user, password, tmuxCmd).then(() => {
+            sessions[id] = { host, user, password, command, logFile };
             json({ ok: true, message: `[${id}] launched on ${user}@${host}` });
           });
-        });
-        conn.on('error', (err) => { json({ ok: false, error: err.message }); delete sessions[id]; });
-        conn.connect({ host, port: 22, username: user, password, keepaliveInterval: 10000, keepaliveCountMax: 10 });
-      }
+        })
+        .catch((err) => json({ ok: false, error: err.message }));
 
     } else if (req.url === '/ssh/stop' && req.method === 'POST') {
-      const { id, host, user, password, command } = JSON.parse(body);
-      const s = sessions[id];
-      if (s) {
-        try { if (s.stream) s.stream.signal('INT'); } catch {}
-        setTimeout(() => {
-          try { if (s.stream) s.stream.signal('KILL'); } catch {}
-          setTimeout(() => {
-            try { if (s.conn) s.conn.end(); } catch {}
-            delete sessions[id];
-          }, 500);
-        }, 1000);
-      }
-      // Always pkill on remote (covers orphaned processes)
-      const cmd = (s && s.command) || command;
-      const h = (s && s.host) || host;
-      const u = (s && s.user) || user;
-      const p = (s && s.password) || password;
-      if (cmd && h && u && p) {
-        const procName = cmd.split('&&').pop().trim().split(/\s+/).slice(0, 2).join(' ');
-        const killConn = new Client();
-        killConn.on('ready', () => {
-          killConn.exec(`ps aux | grep "${procName}" | grep -v grep | grep -v pkill | awk '{print $2}' | xargs -r kill -9`, () => { killConn.end(); });
-        });
-        killConn.on('error', () => {});
-        killConn.connect({ host: h, port: 22, username: u, password: p });
-      }
-      if (!s) delete sessions[id];
-      json({ ok: true, message: `[${id}] stopped` });
+      const { id, host, user, password } = JSON.parse(body);
+      const s = sessions[id] || {};
+      const h = s.host || host;
+      const u = s.user || user;
+      const p = s.password || password;
+
+      if (!h || !u || !p) { json({ ok: true, message: `[${id}] no session info` }); return; }
+
+      // Send C-c (SIGINT), wait 3s, then kill session if still alive
+      const logFile = s.logFile || `/tmp/agrotech_${id}.log`;
+      sshRun(h, u, p,
+        `tmux send-keys -t ${id} C-c 2>/dev/null; sleep 3; tmux kill-session -t ${id} 2>/dev/null; rm -f ${logFile}; echo DONE`
+      )
+        .then(() => { delete sessions[id]; json({ ok: true, message: `[${id}] stopped` }); })
+        .catch(() => { delete sessions[id]; json({ ok: true, message: `[${id}] stopped (force)` }); });
 
     } else if (req.url === '/ssh/output' && req.method === 'POST') {
       const { id, since } = JSON.parse(body);
       const s = sessions[id];
-      if (!s) { json({ ok: true, lines: [], done: true }); return; }
-      const all = s.output.join('');
-      const fresh = since ? all.slice(since) : all;
-      json({ ok: true, lines: fresh, offset: all.length, done: s.done });
+      if (!s) { json({ ok: true, lines: '', offset: 0, done: true }); return; }
+
+      // Check if session is alive + read log file
+      const logFile = s.logFile || `/tmp/agrotech_${id}.log`;
+      sshRun(s.host, s.user, s.password,
+        `tmux has-session -t ${id} 2>/dev/null && echo __ALIVE__ || echo __DEAD__; cat ${logFile} 2>/dev/null`
+      )
+        .then((out) => {
+          const done = out.includes('__DEAD__');
+          const clean = out.replace('__ALIVE__\n', '').replace('__DEAD__\n', '');
+          const offset = clean.length;
+          const fresh = since ? clean.slice(since) : clean;
+          json({ ok: true, lines: fresh, offset, done });
+          if (done) delete sessions[id];
+        })
+        .catch(() => json({ ok: true, lines: '', offset: 0, done: true }));
 
     } else if (req.url === '/ssh/exec' && req.method === 'POST') {
       const { host, user, password, command } = JSON.parse(body);
-      const conn = new Client();
-      conn.on('ready', () => {
-        conn.exec(command, (err, stream) => {
-          if (err) { json({ ok: false, error: err.message }); conn.end(); return; }
-          let out = '';
-          stream.on('data', (d) => (out += d.toString()));
-          stream.stderr.on('data', (d) => (out += d.toString()));
-          stream.on('close', () => { conn.end(); json({ ok: true, output: out }); });
-        });
-      });
-      conn.on('error', (err) => json({ ok: false, error: err.message }));
-      conn.connect({ host, port: 22, username: user, password });
+      sshRun(host, user, password, command)
+        .then((out) => json({ ok: true, output: out }))
+        .catch((err) => json({ ok: false, error: err.message }));
 
     } else if (req.url === '/s3/upload' && req.method === 'POST') {
       const { host, user, password, patrol, recording, bucket, prefix, region, accessKeyId, secretAccessKey } = JSON.parse(body);
       const uploadId = `${patrol}/${recording}`;
 
-      // Store upload progress
       if (!global.uploads) global.uploads = {};
       global.uploads[uploadId] = { status: 'listing', files: [], uploaded: 0, total: 0, errors: [] };
 
@@ -130,12 +109,11 @@ const server = http.createServer((req, res) => {
       const sshConn = new Client();
 
       sshConn.on('ready', () => {
-        // List all files in the recording
         sshConn.exec(`find /AgroTech_recordings/${patrol}/${recording} -type f -exec stat --format='%n|%s' {} \\;`, (err, stream) => {
           if (err) { json({ ok: false, error: err.message }); sshConn.end(); return; }
           let out = '';
           stream.on('data', (d) => (out += d.toString()));
-          stream.stderr.on('data', (d) => {});
+          stream.stderr.on('data', () => {});
           stream.on('close', () => {
             const basePath = `/AgroTech_recordings/${patrol}/${recording}/`;
             const files = out.trim().split('\n').filter(Boolean).map(l => {
@@ -147,7 +125,6 @@ const server = http.createServer((req, res) => {
             global.uploads[uploadId].total = files.length;
             global.uploads[uploadId].status = 'uploading';
 
-            // Upload files sequentially via SFTP
             sshConn.sftp((err, sftp) => {
               if (err) { global.uploads[uploadId].status = 'error'; global.uploads[uploadId].errors.push(err.message); sshConn.end(); return; }
 
@@ -171,17 +148,8 @@ const server = http.createServer((req, res) => {
                     return;
                   }
                   s3.send(new PutObjectCommand({ Bucket: bucket, Key: s3Key, Body: data }))
-                    .then(() => {
-                      global.uploads[uploadId].uploaded++;
-                      idx++;
-                      uploadNext();
-                    })
-                    .catch((e) => {
-                      global.uploads[uploadId].errors.push(`${f.rel}: ${e.message}`);
-                      global.uploads[uploadId].uploaded++;
-                      idx++;
-                      uploadNext();
-                    });
+                    .then(() => { global.uploads[uploadId].uploaded++; idx++; uploadNext(); })
+                    .catch((e) => { global.uploads[uploadId].errors.push(`${f.rel}: ${e.message}`); global.uploads[uploadId].uploaded++; idx++; uploadNext(); });
                 });
               };
               uploadNext();
