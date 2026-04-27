@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 
-const SSH_URL = 'http://localhost:4500';
+const SSH_URL = '';
 const CREDS_KEY = 'agrotech_aws_creds';
 
 const loadCreds = () => {

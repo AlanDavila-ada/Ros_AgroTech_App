@@ -1,0 +1,11 @@
+/AgroTech_recordings/_events.jsonl {
+    weekly
+    rotate 4
+    size 50M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    create 0644 ada ada
+}

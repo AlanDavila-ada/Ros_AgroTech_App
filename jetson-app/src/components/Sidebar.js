@@ -5,6 +5,7 @@ export const Sidebar = ({
   jetsonHost, onJetsonHostChange, jetsonPort, onJetsonPortChange,
   domainId, onDomainIdChange,
   localConnected, jetsonConnected,
+  recordingActive,
 }) => {
   const [collapsed, setCollapsed] = useState(false);
 
@@ -61,11 +62,11 @@ export const Sidebar = ({
           </div>
           <div style={st.navDot(localConnected)} />
         </button>
-        <button style={st.navItem(view === 'jetson')} onClick={() => onViewChange('jetson')}>
+        <button style={st.navItem(view === 'jetson', recordingActive)} onClick={() => onViewChange('jetson')}>
           <span style={st.navIcon}>📡</span>
           <div>
             <div style={st.navTitle}>Jetson</div>
-            <div style={st.navDesc}>Cameras, Recording & Data</div>
+            <div style={st.navDesc}>{recordingActive ? <span style={{ color: '#ff4757', fontWeight: 700 }}>● Recording</span> : 'Cameras, Recording & Data'}</div>
           </div>
           <div style={st.navDot(jetsonConnected)} />
         </button>
@@ -99,10 +100,10 @@ const st = {
 
   navSection: { flex: 1, padding: '16px 12px', display: 'flex', flexDirection: 'column', gap: 4 },
   navLabel: { fontSize: 10, fontWeight: 700, color: '#555', letterSpacing: '1.5px', marginBottom: 8, paddingLeft: 4 },
-  navItem: (active) => ({
+  navItem: (active, recording) => ({
     display: 'flex', alignItems: 'center', gap: 12, padding: '12px 12px', width: '100%',
-    background: active ? '#6c5ce712' : 'transparent',
-    border: active ? '1px solid #6c5ce733' : '1px solid transparent',
+    background: recording ? '#ff475710' : (active ? '#6c5ce712' : 'transparent'),
+    border: `1px solid ${recording ? '#ff475744' : (active ? '#6c5ce733' : 'transparent')}`,
     borderRadius: 10, cursor: 'pointer', textAlign: 'left', color: '#e0e0e6', transition: 'all 0.15s',
   }),
   navIcon: { fontSize: 20, flexShrink: 0 },

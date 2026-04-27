@@ -14,37 +14,33 @@ const body = (data, host) => {
   return JSON.stringify({ ...data, host, user: 'ada', password: 'ada123' });
 };
 
-export const apiExec = async (command, host) => {
-  const r = await fetch(`${API_URL}/exec`, {
+const post = async (path, data, host) => {
+  const r = await fetch(`${API_URL}/${path}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: body({ command }, host),
+    body: body(data, host),
   });
   return r.json();
 };
 
-export const apiLaunch = async (id, command, host) => {
-  const r = await fetch(`${API_URL}/launch`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: body({ id, command }, host),
-  });
-  return r.json();
-};
-
-export const apiStop = async (id, host) => {
-  const r = await fetch(`${API_URL}/stop`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: body({ id }, host),
-  });
-  return r.json();
-};
-
+export const apiExec = (command, host) => post('exec', { command }, host);
+export const apiLaunch = (id, command, host) => post('launch', { id, command }, host);
+export const apiStop = (id, host, opts = {}) => post('stop', { id, ...opts }, host);
 export const apiOutput = async (id, since) => {
+  // /output never needs SSH creds
   const r = await fetch(`${API_URL}/output`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ id, since }),
   });
   return r.json();
 };
+
+export const apiConfig = (host) => post('config', {}, host);
+export const apiLog = (events, host) => post('log', { events }, host);
+export const apiLogList = (filters, host) => post('log/list', filters || {}, host);
+export const apiServicesStatus = (host) => post('services/status', {}, host);
+export const apiServicesRestart = (name, action, host) => post('services/restart', { name, action }, host);
+export const apiPreflight = (ids, host) => post('preflight', ids, host);
+export const apiMcapInfo = (ids, host) => post('mcap-info', ids, host);
 
 export const getRosbridgeUrl = (jetsonHost, jetsonPort = '9090') => {
   if (isLocal) return `ws://${window.location.hostname}:${jetsonPort}`;

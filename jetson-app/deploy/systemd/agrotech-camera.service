@@ -1,0 +1,18 @@
+[Unit]
+Description=AgroTech camera_node (dual IMX477 → cameras.mcap)
+After=agrotech-rosbridge.service
+Requires=agrotech-rosbridge.service
+
+[Service]
+Type=simple
+User=ada
+WorkingDirectory=/home/ada
+Environment=ROS_DOMAIN_ID=42
+Environment=RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+Environment=CYCLONEDDS_URI=file:///home/ada/cyclonedds.xml
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && source /home/ada/ros2_ws/install/setup.bash 2>/dev/null; exec python3 /home/ada/camera_node.py'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

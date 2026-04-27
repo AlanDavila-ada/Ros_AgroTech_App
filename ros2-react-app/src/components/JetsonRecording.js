@@ -1,9 +1,19 @@
 import { useState, useEffect, useRef } from 'react';
 import ROSLIB from 'roslib';
 import { rosEnv } from '../rosEnv';
+import { apiPreflight, apiMcapInfo, apiLaunch, apiStop, apiOutput, apiExec } from '../apiSsh';
+import { logEvent } from '../hooks/useEventLogger';
 
-const SSH_URL = 'http://localhost:4500';
 const STORAGE_KEY = 'agrotech_jetson_rec_topics';
+const SAFE_ID = /^[A-Za-z0-9_.-]+$/;
+const START_ACK_TIMEOUT_MS = 8000;
+const newUuid = () => {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0, v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+};
 
 const TOPIC_SECTIONS = [
   { id: 'local', label: '📡 Local Sensors', topics: [
@@ -63,19 +73,24 @@ const loadTopics = () => {
 };
 const saveTopics = (t) => localStorage.setItem(STORAGE_KEY, JSON.stringify(t));
 
-export const JetsonRecording = ({ jetsonHost, connected, ros, domainId }) => {
+export const JetsonRecording = ({ jetsonHost, connected, ros, domainId, rec, identity }) => {
   const [topics, setTopics] = useState(() => loadTopics() || ALL_DEFAULT_TOPICS);
   const [recordVideo, setRecordVideo] = useState(true);
-  const [patrolId, setPatrolId] = useState('');
-  const [recordingId, setRecordingId] = useState('');
-  const [companyId, setCompanyId] = useState('chada');
-  const [deviceId, setDeviceId] = useState('1st-demo');
-  const [recording, setRecording] = useState(false);
-  const [camStatus, setCamStatus] = useState(null);
+  const [patrolId, setPatrolId] = useState(() => newUuid());
+  const [recordingId, setRecordingId] = useState(() => newUuid());
+  // Customer/device IDs are owned by App.js (fetched once from Jetson env via /ssh/config).
+  const companyId = identity?.customerId || '';
+  const deviceId = identity?.deviceId || '';
+  const [comment, setComment] = useState('');
+  const recording = !!rec?.active;
+  const [topicsExpanded, setTopicsExpanded] = useState(false);
   const [sensorFrames, setSensorFrames] = useState(0);
   const [error, setError] = useState('');
   const [overwriteWarn, setOverwriteWarn] = useState(false);
   const [checking, setChecking] = useState(false);
+  const [preflight, setPreflight] = useState(null);
+  const [staleSession, setStaleSession] = useState(null);
+  const [stopReport, setStopReport] = useState(null);
   const [adding, setAdding] = useState(false);
   const [newTopic, setNewTopic] = useState('');
   const [newType, setNewType] = useState('std_msgs/String');
@@ -85,14 +100,19 @@ export const JetsonRecording = ({ jetsonHost, connected, ros, domainId }) => {
   const pubCountRef = useRef({}); // { topic: number }
   const pollRef = useRef(null);
   const offsetRef = useRef(0);
+  const cmdTopicRef = useRef(null);
 
-  // Subscribe to /recording/status from camera_node.py
   useEffect(() => {
-    if (!ros || !connected) return;
-    const sub = new ROSLIB.Topic({ ros, name: '/recording/status', messageType: 'std_msgs/String' });
-    sub.subscribe((msg) => { try { setCamStatus(JSON.parse(msg.data)); } catch {} });
-    return () => { sub.unsubscribe(); };
-  }, [ros, connected]);
+    if (!ros) { cmdTopicRef.current = null; return; }
+    const t = new ROSLIB.Topic({ ros, name: '/recording/command', messageType: 'std_msgs/String', latch: true, queue_size: 1 });
+    t.advertise();
+    cmdTopicRef.current = t;
+    return () => { try { t.unadvertise(); } catch {} cmdTopicRef.current = null; };
+  }, [ros]);
+
+  // /recording/status is owned by the global hook (rec).
+  const camStatus = rec?.status || null;
+
 
   // Check publisher counts periodically via SSH
   useEffect(() => {
@@ -101,12 +121,10 @@ export const JetsonRecording = ({ jetsonHost, connected, ros, domainId }) => {
     const checkPubs = async () => {
       try {
         const topicList = enabled.map(t => t.topic).join(' ');
-        const r = await fetch(`${SSH_URL}/ssh/exec`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ host: jetsonHost, user: 'ada', password: 'ada123',
-            command: `source /opt/ros/humble/setup.bash && export ROS_DOMAIN_ID=${domainId} && for t in ${topicList}; do echo "$t $(ros2 topic info $t 2>/dev/null | grep -oP 'Publisher count: \\K[0-9]+' || echo 0)"; done` }),
-        });
-        const d = await r.json();
+        const d = await apiExec(
+          `source /opt/ros/humble/setup.bash && export ROS_DOMAIN_ID=${domainId} && for t in ${topicList}; do echo "$t $(ros2 topic info $t 2>/dev/null | grep -oP 'Publisher count: \\K[0-9]+' || echo 0)"; done`,
+          jetsonHost
+        );
         if (d.ok && d.output) {
           const counts = {};
           d.output.trim().split('\n').forEach(line => {
@@ -190,75 +208,142 @@ export const JetsonRecording = ({ jetsonHost, connected, ros, domainId }) => {
   };
 
   const publishRecordingCommand = (cmd) => {
-    if (!ros) return;
-    const topic = new ROSLIB.Topic({ ros, name: '/recording/command', messageType: 'std_msgs/String' });
-    topic.publish(new ROSLIB.Message({ data: JSON.stringify(cmd) }));
+    const t = cmdTopicRef.current;
+    if (!t) return;
+    t.publish(new ROSLIB.Message({ data: JSON.stringify(cmd) }));
+  };
+
+  const waitForCameraAck = (state) => new Promise((resolve) => {
+    const start = Date.now();
+    const iv = setInterval(() => {
+      const s = rec?.status;
+      if (s && s.state === state) { clearInterval(iv); resolve(true); }
+      else if (Date.now() - start > START_ACK_TIMEOUT_MS) { clearInterval(iv); resolve(false); }
+    }, 150);
+  });
+
+  const launchSensorRecorder = async (ids, force) => {
+    const topicsArg = enabledSensorTopics.map(t => `${t.topic}:${t.type}`).join(',');
+    const commentArg = comment ? ` --comment "$(echo ${btoa(unescape(encodeURIComponent(comment)))} | base64 -d)"` : '';
+    const cmd = `${rosEnv(domainId)} && python3 /home/ada/mcap_recorder.py --company "${ids.company}" --device "${ids.device}" --patrol "${ids.patrol}" --recording "${ids.recording}" --topics "${topicsArg}"${commentArg}`;
+    if (force) { try { await apiStop('mcap_recorder', jetsonHost, { force: true }); } catch {} }
+    const r = await apiLaunch('mcap_recorder', cmd, jetsonHost);
+    if (!r.ok && r.alive) { setStaleSession(r); return false; }
+    return true;
   };
 
   const toggleRecording = async () => {
     if (recording) {
-      // === STOP ===
+      setStopReport(null);
+      rec?.markPending?.('stop');
+      logEvent('info', 'recording.stop.requested', { source: 'recording_tab' }, { host: jetsonHost });
       if (recordVideo) publishRecordingCommand({ action: 'stop' });
       if (enabledSensorTopics.length > 0) {
-        try { await fetch(`${SSH_URL}/ssh/stop`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: 'mcap_recorder' }) }); } catch {}
+        try { await apiStop('mcap_recorder', jetsonHost); } catch {}
       }
       clearInterval(pollRef.current);
-      setRecording(false);
+      (async () => {
+        const ids = { company: companyId, device: deviceId, patrol: patrolId, recording: recordingId };
+        const filesToCheck = [];
+        if (enabledSensorTopics.length > 0) filesToCheck.push('combined.mcap');
+        if (recordVideo) filesToCheck.push('cameras.mcap');
+        const deadline = Date.now() + 8000;
+        let last = null;
+        while (Date.now() < deadline) {
+          let totalSize = 0; let anyExists = false; let lastInfo = '';
+          for (const f of filesToCheck) {
+            try {
+              const r = await apiMcapInfo({ ...ids, file: f }, jetsonHost);
+              if (r.ok) { totalSize += r.sizeBytes || 0; if (r.exists) anyExists = true; if (r.info) lastInfo = r.info; }
+            } catch {}
+          }
+          last = { ok: anyExists && totalSize > 0, sizeBytes: totalSize, info: lastInfo };
+          if (last.ok) break;
+          await new Promise(res => setTimeout(res, 600));
+        }
+        if (last) {
+          setStopReport(last);
+          logEvent(last.ok ? 'info' : 'warn', last.ok ? 'recording.mcap.ok' : 'recording.mcap.empty_or_corrupt',
+            { sizeBytes: last.sizeBytes }, { host: jetsonHost });
+        }
+      })();
       return;
     }
 
-    // === START ===
     if (!patrolId.trim() || !recordingId.trim() || !companyId.trim() || !deviceId.trim()) {
       setError('Company, Device, Patrol and Recording IDs are required.');
       return;
+    }
+    for (const [label, v] of [['Company', companyId], ['Device', deviceId], ['Patrol', patrolId], ['Recording', recordingId]]) {
+      if (!SAFE_ID.test(v)) { setError(`${label} ID must match [A-Za-z0-9_.-]+`); return; }
     }
     if (!recordVideo && enabledSensorTopics.length === 0) {
       setError('Enable video recording or select at least one sensor topic.');
       return;
     }
     setError('');
+    setStopReport(null);
+    logEvent('info', 'recording.start.requested', {
+      patrol: patrolId, recording: recordingId, customer: companyId, device: deviceId,
+      video: recordVideo, sensor_topics: enabledSensorTopics.length,
+      comment: comment ? comment.slice(0, 200) : undefined,
+    }, { host: jetsonHost });
 
-    if (!overwriteWarn) {
+    if (!preflight) {
       setChecking(true);
       try {
-        const chk = await fetch(`${SSH_URL}/ssh/exec`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ host: jetsonHost, user: 'ada', password: 'ada123', command: `test -d /AgroTech_recordings/${companyId}/${deviceId}/${patrolId}/${recordingId} && echo EXISTS || echo NO` }),
-        });
-        const d = await chk.json();
-        if (d.ok && d.output.trim() === 'EXISTS') { setOverwriteWarn(true); setChecking(false); return; }
-      } catch {}
-      setChecking(false);
+        const pf = await apiPreflight({ company: companyId, device: deviceId, patrol: patrolId, recording: recordingId }, jetsonHost);
+        setChecking(false);
+        if (!pf.ok) { setError(pf.error || 'Pre-flight failed'); return; }
+        const c = pf.checks;
+        const issues = [];
+        if (!c.disk?.ok) issues.push(`Disk: ${c.disk?.availMB || 0} MB free (need ≥ 1024)`);
+        if (!c.servicesOk) issues.push(`Services not all active: ${JSON.stringify(c.services)}`);
+        if (c.staleRecorder.length > 0) issues.push(`Stale mcap_recorder process(es): ${c.staleRecorder.join(', ')}`);
+        if (c.staleTmux) issues.push('Stale mcap_recorder tmux session');
+        if (c.recordingExists) setOverwriteWarn(true);
+        if (issues.length > 0 || c.disk?.warn) {
+          setPreflight({ ...c, issues });
+          logEvent('warn', 'recording.preflight.issues', { issues, disk: c.disk, services: c.services }, { host: jetsonHost });
+          return;
+        }
+      } catch (e) {
+        setChecking(false); setError(`Pre-flight failed: ${e.message}`);
+        logEvent('error', 'recording.preflight.error', { error: e.message }, { host: jetsonHost });
+        return;
+      }
     }
-    setOverwriteWarn(false);
+    setPreflight(null);
+
+    if (overwriteWarn) setOverwriteWarn(false);
     setSensorFrames(0);
     offsetRef.current = 0;
+    const ids = { company: companyId, device: deviceId, patrol: patrolId, recording: recordingId };
 
-    // 1. Camera direct MCAP
+    let cameraAcked = true;
     if (recordVideo) {
-      publishRecordingCommand({ action: 'start', company: companyId, device: deviceId, patrol: patrolId, recording: recordingId });
+      rec?.markPending?.('start');
+      publishRecordingCommand({ action: 'start', ...ids, comment });
+      cameraAcked = await waitForCameraAck('recording');
+      if (!cameraAcked) {
+        logEvent('warn', 'recording.camera.ack_timeout', { timeout_ms: START_ACK_TIMEOUT_MS }, { host: jetsonHost });
+      } else {
+        logEvent('info', 'recording.camera.acked', {}, { host: jetsonHost });
+      }
     }
 
-    // 2. Sensor recorder
     if (enabledSensorTopics.length > 0) {
-      const topicsArg = enabledSensorTopics.map(t => `${t.topic}:${t.type}`).join(',');
-      try {
-        await fetch(`${SSH_URL}/ssh/launch`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            id: 'mcap_recorder', host: jetsonHost, user: 'ada', password: 'ada123',
-            command: `${rosEnv(domainId)} && python3 /home/ada/mcap_recorder.py --company "${companyId}" --device "${deviceId}" --patrol "${patrolId}" --recording "${recordingId}" --topics "${topicsArg}"`,
-          }),
-        });
-      } catch {}
-
+      const launched = await launchSensorRecorder(ids, false);
+      if (!launched) {
+        if (recordVideo) publishRecordingCommand({ action: 'stop' });
+        rec?.markPending?.(null);
+        logEvent('warn', 'recording.sensor.stale_session', { topics: enabledSensorTopics.length }, { host: jetsonHost });
+        return;
+      }
+      logEvent('info', 'recording.sensor.launched', { topics: enabledSensorTopics.length }, { host: jetsonHost });
       pollRef.current = setInterval(async () => {
         try {
-          const r = await fetch(`${SSH_URL}/ssh/output`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ id: 'mcap_recorder', since: offsetRef.current }),
-          });
-          const d = await r.json();
+          const d = await apiOutput('mcap_recorder', offsetRef.current);
           if (d.lines) {
             offsetRef.current = d.offset;
             for (const l of d.lines.split('\n').filter(Boolean)) {
@@ -268,8 +353,29 @@ export const JetsonRecording = ({ jetsonHost, connected, ros, domainId }) => {
         } catch {}
       }, 1000);
     }
+    if (recordVideo && !cameraAcked) {
+      setError('Camera did not confirm start within 8s — check the live counters above. If frames stay at 0, stop and retry.');
+    }
+  };
 
-    setRecording(true);
+  const adoptStaleSession = () => {
+    setStaleSession(null);
+    pollRef.current = setInterval(async () => {
+      try {
+        const d = await apiOutput('mcap_recorder', offsetRef.current);
+        if (d.lines) {
+          offsetRef.current = d.offset;
+          for (const l of d.lines.split('\n').filter(Boolean)) {
+            try { const p = JSON.parse(l); if (p.counts) setSensorFrames(Object.values(p.counts).reduce((a, b) => a + b, 0)); } catch {}
+          }
+        }
+      } catch {}
+    }, 1000);
+  };
+
+  const killStaleSession = async () => {
+    try { await apiStop('mcap_recorder', jetsonHost, { force: true }); } catch {}
+    setStaleSession(null);
   };
 
   useEffect(() => () => clearInterval(pollRef.current), []);
@@ -293,36 +399,211 @@ export const JetsonRecording = ({ jetsonHost, connected, ros, domainId }) => {
 
   return (
     <div style={st.container}>
-      {/* Status banner */}
-      {recording && (
-        <div style={st.statusBanner}>
-          <div style={st.statusRow}>
-            <span style={st.statusDot} />
-            <span style={st.statusLabel}>RECORDING</span>
-            <span style={st.statusTime}>{Math.floor(camElapsed)}s</span>
+      {preflight && (
+        <div style={st.modalOverlay}>
+          <div style={st.modalCard}>
+            <div style={st.modalTitle}>Pre-flight checks</div>
+            <ul style={st.checkList}>
+              <li style={st.checkItem(preflight.disk?.ok && !preflight.disk?.warn)}>
+                Free disk: <b>{preflight.disk?.availMB} MB</b> {preflight.disk?.warn && '(low)'}
+              </li>
+              <li style={st.checkItem(preflight.servicesOk)}>
+                Services: {Object.entries(preflight.services).map(([k, v]) =>
+                  <span key={k} style={{ color: v === 'active' ? '#00d26a' : '#ff4757', marginRight: 8 }}>{k.replace('agrotech-', '')}:{v}</span>
+                )}
+              </li>
+              <li style={st.checkItem(preflight.staleRecorder.length === 0)}>
+                Stale recorder process: {preflight.staleRecorder.length === 0 ? 'none' : preflight.staleRecorder.join(', ')}
+              </li>
+              <li style={st.checkItem(!preflight.staleTmux)}>
+                Stale tmux session: {preflight.staleTmux ? 'yes — will be force-killed' : 'no'}
+              </li>
+              {preflight.recordingExists && (
+                <li style={st.checkItem(false)}>
+                  Recording dir already exists at this ID — files will be overwritten.
+                </li>
+              )}
+            </ul>
+            {preflight.issues.length > 0 && (
+              <div style={st.modalErr}>{preflight.issues.join(' · ')}</div>
+            )}
+            <div style={st.modalActions}>
+              <button style={st.btnGhost} onClick={() => setPreflight(null)}>Cancel</button>
+              <button
+                style={st.btnPrimary}
+                disabled={!preflight.disk?.ok || !preflight.servicesOk}
+                onClick={() => { setPreflight(null); toggleRecording(); }}
+              >
+                {preflight.issues.length > 0 ? 'Force record anyway' : 'Start recording'}
+              </button>
+            </div>
           </div>
-          <div style={st.statusCounts}>
+        </div>
+      )}
+
+      {staleSession && (
+        <div style={st.modalOverlay}>
+          <div style={st.modalCard}>
+            <div style={st.modalTitle}>Existing recorder session</div>
+            <div style={{ fontSize: 12, color: '#aaa', marginBottom: 8 }}>
+              A previous mcap_recorder has been running for <b>{staleSession.uptime != null ? `${staleSession.uptime}s` : 'unknown time'}</b>.
+            </div>
+            {staleSession.lastLine && <pre style={st.lastLine}>{staleSession.lastLine}</pre>}
+            <div style={st.modalActions}>
+              <button style={st.btnGhost} onClick={() => setStaleSession(null)}>Dismiss</button>
+              <button style={st.btnRed} onClick={killStaleSession}>Force kill</button>
+              <button style={st.btnPrimary} onClick={adoptStaleSession}>Adopt</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {stopReport && (
+        <div style={stopReport.ok ? st.okBanner : st.warnBanner}>
+          <div style={{ fontWeight: 700, marginBottom: 4 }}>
+            {stopReport.ok ? '✓ Recording closed' : '⚠ Recording may be empty or corrupt'}
+          </div>
+          <div style={{ fontSize: 11, opacity: 0.85 }}>
+            File size: {(stopReport.sizeBytes / 1e6).toFixed(1)} MB
+          </div>
+          <button style={st.dismissBtn} onClick={() => setStopReport(null)}>×</button>
+        </div>
+      )}
+
+      {/* === LIVE PANEL === */}
+      {recording && (
+        <div style={st.livePanel}>
+          <div style={st.liveHeader}>
+            <span style={st.liveDot} />
+            <span style={st.liveTitle}>LIVE</span>
+            <span style={st.liveTime}>{Math.floor(camElapsed / 60).toString().padStart(2, '0')}:{(Math.floor(camElapsed) % 60).toString().padStart(2, '0')}</span>
+            <button onClick={toggleRecording} style={st.bigStopBtn}>⏹ Stop recording</button>
+          </div>
+          <div style={st.liveCounts}>
             {recordVideo && (
               <div style={st.countItem}>
-                <span style={st.countLabel}>📷 Video (direct MCAP)</span>
+                <span style={st.countLabel}>📷 Video</span>
                 <span style={st.countValue}>{camFrames} frames</span>
               </div>
             )}
             {enabledSensorTopics.length > 0 && (
               <div style={st.countItem}>
-                <span style={st.countLabel}>🤖 Sensors/AGV</span>
+                <span style={st.countLabel}>🤖 Sensors</span>
                 <span style={st.countValue}>{sensorFrames} msgs</span>
               </div>
             )}
+            <div style={st.countItem}>
+              <span style={st.countLabel}>📦 Patrol</span>
+              <span style={st.countValueId} title={patrolId}>{patrolId.slice(0, 8)}…</span>
+            </div>
+            <div style={st.countItem}>
+              <span style={st.countLabel}>🎬 Recording</span>
+              <span style={st.countValueId} title={recordingId}>{recordingId.slice(0, 8)}…</span>
+            </div>
           </div>
         </div>
       )}
 
-      {/* Video toggle + Sensor topics */}
-      <div style={st.section}>
-        <div style={st.sectionHeader}>
-          <span style={st.sectionTitle}>What to Record</span>
+      {/* === ACTION ZONE === */}
+      {!recording && (
+        <div style={st.actionZone}>
+          <div style={st.actionHeader}>
+            <div>
+              <div style={st.actionTitle}>Start a recording</div>
+              <div style={st.actionSub}>Customer & device are pre-set. Patrol & recording IDs are auto-generated; edit or regenerate as needed.</div>
+            </div>
+            <button
+              onClick={toggleRecording}
+              style={st.bigRecordBtn(!connected || checking || !companyId || !deviceId)}
+              disabled={!connected || checking || !companyId || !deviceId}
+            >
+              <span style={st.bigRecordDot} />
+              {checking ? '⏳ Pre-flight…' : overwriteWarn ? '⚠ Overwrite?' : 'Start recording'}
+            </button>
+          </div>
+
+          <div style={st.idChips}>
+            <div style={st.chip}>
+              <span style={st.chipLabel}>Customer</span>
+              <span style={st.chipValue} title={companyId}>{companyId || '—'}</span>
+            </div>
+            <div style={st.chip}>
+              <span style={st.chipLabel}>Device</span>
+              <span style={st.chipValue} title={deviceId}>{deviceId || '—'}</span>
+            </div>
+          </div>
+
+          <div style={{ ...st.recRow, marginTop: 8 }}>
+            <div style={st.idField}>
+              <label style={st.idFieldLabel}>Patrol ID</label>
+              <input style={{ ...st.input, ...(error && !patrolId.trim() ? { borderColor: '#ff475766' } : {}) }}
+                value={patrolId}
+                onChange={e => { setPatrolId(e.target.value); setError(''); setOverwriteWarn(false); }} />
+            </div>
+            <button style={st.regenBtn} title="Regenerate" onClick={() => setPatrolId(newUuid())}>↻</button>
+            <div style={st.idField}>
+              <label style={st.idFieldLabel}>Recording ID</label>
+              <input style={{ ...st.input, ...(error && !recordingId.trim() ? { borderColor: '#ff475766' } : {}) }}
+                value={recordingId}
+                onChange={e => { setRecordingId(e.target.value); setError(''); setOverwriteWarn(false); }} />
+            </div>
+            <button style={st.regenBtn} title="Regenerate" onClick={() => setRecordingId(newUuid())}>↻</button>
+          </div>
+
+          <div style={{ marginTop: 8 }}>
+            <label style={st.idFieldLabel}>Comment (optional — saved into the mcap)</label>
+            <input style={st.input} placeholder="e.g. weekly inspection, west field, foggy"
+              value={comment} maxLength={500}
+              onChange={e => setComment(e.target.value)} />
+          </div>
+
+          {error && <div style={st.errorMsg}>{error}</div>}
+          {(!companyId || !deviceId) && <div style={st.warnMsg}>Customer / device IDs not set. Configure AGROTECH_CUSTOMER_ID and AGROTECH_DEVICE_ID on the Jetson.</div>}
+          {!connected && <div style={st.warnMsg}>Jetson not connected — go to Setup to bring up rosbridge.</div>}
         </div>
+      )}
+
+      {recording && (
+        <div style={st.section}>
+          <div style={st.sectionHeader}>
+            <span style={st.sectionTitle}>Recording details</span>
+          </div>
+          <div style={st.idChips}>
+            <div style={st.chip}>
+              <span style={st.chipLabel}>Customer</span>
+              <span style={st.chipValue} title={companyId}>{companyId || '—'}</span>
+            </div>
+            <div style={st.chip}>
+              <span style={st.chipLabel}>Device</span>
+              <span style={st.chipValue} title={deviceId}>{deviceId || '—'}</span>
+            </div>
+          </div>
+          {comment && (
+            <div style={{ marginTop: 10, padding: '8px 12px', background: '#0d0d14', borderRadius: 8, fontSize: 11, color: '#bbb' }}>
+              <span style={{ color: '#666', marginRight: 6 }}>💬</span>{comment}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* === TOPICS (collapsible) === */}
+      <div style={st.section}>
+        <button
+          onClick={() => setTopicsExpanded(!topicsExpanded)}
+          style={st.disclosureHeader}
+          aria-expanded={topicsExpanded}
+        >
+          <span style={st.sectionTitle}>What to record</span>
+          <span style={st.disclosureMeta}>
+            <span style={st.badge}>
+              {recordVideo ? '📷 Video + ' : ''}{enabledSensorTopics.length}/{topics.length} topics
+            </span>
+            <span style={st.disclosureCaret}>{topicsExpanded ? '▾' : '▸'}</span>
+          </span>
+        </button>
+
+        {topicsExpanded && (
+          <div style={{ marginTop: 12 }}>
 
         {/* Video toggle */}
         <div style={st.videoRow}>
@@ -415,30 +696,8 @@ export const JetsonRecording = ({ jetsonHost, connected, ros, domainId }) => {
         ) : (
           <button style={st.addBtn} onClick={() => setAdding(true)}>+ Add Topic</button>
         ))}
-      </div>
-
-      {/* Recording controls */}
-      <div style={st.section}>
-        <div style={st.recRow}>
-          <input style={st.input} placeholder="Company" value={companyId}
-            onChange={e => { setCompanyId(e.target.value); setError(''); setOverwriteWarn(false); }} disabled={recording} />
-          <input style={st.input} placeholder="Device" value={deviceId}
-            onChange={e => { setDeviceId(e.target.value); setError(''); setOverwriteWarn(false); }} disabled={recording} />
-        </div>
-        <div style={{ ...st.recRow, marginTop: 8 }}>
-          <input style={{ ...st.input, ...(error && !patrolId.trim() ? { borderColor: '#ff475766' } : {}) }}
-            placeholder="Patrol ID" value={patrolId}
-            onChange={e => { setPatrolId(e.target.value); setError(''); setOverwriteWarn(false); }} disabled={recording} />
-          <input style={{ ...st.input, ...(error && !recordingId.trim() ? { borderColor: '#ff475766' } : {}) }}
-            placeholder="Recording ID" value={recordingId}
-            onChange={e => { setRecordingId(e.target.value); setError(''); setOverwriteWarn(false); }} disabled={recording} />
-          <button onClick={toggleRecording} style={st.recBtn(recording)} disabled={!connected || checking}>
-            <span style={st.recDot(recording)} />
-            {recording ? 'Stop' : checking ? '⏳ Checking...' : overwriteWarn ? '⚠ Overwrite?' : 'Record'}
-          </button>
-        </div>
-        {error && <div style={st.errorMsg}>{error}</div>}
-        {!connected && <div style={st.warnMsg}>Connect to Jetson rosbridge first (Setup tab)</div>}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -503,4 +762,57 @@ const st = {
   recDot: (active) => ({ width: 8, height: 8, borderRadius: '50%', background: active ? '#ff4757' : '#00d26a', boxShadow: active ? '0 0 8px #ff475788' : 'none' }),
   errorMsg: { marginTop: 8, padding: '6px 12px', background: '#ff475712', border: '1px solid #ff475733', borderRadius: 8, color: '#ff4757', fontSize: 11, fontWeight: 600 },
   warnMsg: { marginTop: 8, padding: '6px 12px', background: '#ff9f4312', border: '1px solid #ff9f4333', borderRadius: 8, color: '#ff9f43', fontSize: 11 },
+
+  modalOverlay: { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 },
+  modalCard: { background: '#111118', border: '1px solid #2a2a3a', borderRadius: 12, padding: 20, maxWidth: 480, width: '92%' },
+  modalTitle: { fontSize: 14, fontWeight: 700, color: '#e0e0e6', marginBottom: 12 },
+  modalErr: { padding: '8px 12px', background: '#ff475712', border: '1px solid #ff475733', borderRadius: 8, color: '#ff4757', fontSize: 11, marginBottom: 12 },
+  modalActions: { display: 'flex', gap: 8, justifyContent: 'flex-end' },
+  btnGhost: { padding: '6px 14px', borderRadius: 8, fontSize: 11, fontWeight: 700, cursor: 'pointer', background: '#1a1a24', border: '1px solid #2a2a3a', color: '#888' },
+  btnPrimary: { padding: '6px 14px', borderRadius: 8, fontSize: 11, fontWeight: 700, cursor: 'pointer', background: '#6c5ce715', border: '1px solid #6c5ce744', color: '#6c5ce7' },
+  btnRed: { padding: '6px 14px', borderRadius: 8, fontSize: 11, fontWeight: 700, cursor: 'pointer', background: '#ff475715', border: '1px solid #ff475744', color: '#ff4757' },
+  checkList: { listStyle: 'none', padding: 0, margin: '0 0 12px 0', display: 'flex', flexDirection: 'column', gap: 6 },
+  checkItem: (ok) => ({ padding: '8px 12px', borderRadius: 8, fontSize: 11,
+    background: ok ? '#00d26a10' : '#ff475710', border: `1px solid ${ok ? '#00d26a33' : '#ff475733'}`,
+    color: ok ? '#aac' : '#ff9f43' }),
+  lastLine: { background: '#000', color: '#aaa', padding: 8, borderRadius: 6, fontSize: 10, overflow: 'auto', maxHeight: 80, marginBottom: 12 },
+
+  idChips: { display: 'flex', gap: 10, marginBottom: 10 },
+  chip: { flex: 1, minWidth: 0, padding: '8px 12px', background: '#0d0d14', border: '1px solid #1e1e2a', borderRadius: 8, display: 'flex', flexDirection: 'column', gap: 2 },
+  chipLabel: { fontSize: 9, fontWeight: 700, color: '#6c5ce7', letterSpacing: '0.5px', textTransform: 'uppercase' },
+  chipValue: { fontSize: 11, color: '#aaa', fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  idField: { flex: 1, display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 },
+  idFieldLabel: { fontSize: 9, fontWeight: 700, color: '#888', letterSpacing: '0.5px', textTransform: 'uppercase' },
+  regenBtn: { padding: '6px 10px', borderRadius: 8, fontSize: 14, fontWeight: 700, cursor: 'pointer', background: '#1a1a24', border: '1px solid #2a2a3a', color: '#888', alignSelf: 'flex-end', height: 34 },
+
+  livePanel: { background: 'linear-gradient(180deg, #1a0d10 0%, #0f0809 100%)', border: '1px solid #ff475755', borderRadius: 12, padding: 18, boxShadow: '0 0 24px #ff475722' },
+  liveHeader: { display: 'flex', alignItems: 'center', gap: 14, marginBottom: 14, flexWrap: 'wrap' },
+  liveDot: { width: 14, height: 14, borderRadius: '50%', background: '#ff4757', boxShadow: '0 0 12px #ff4757', animation: 'recPulse 1.6s ease-out infinite' },
+  liveTitle: { fontSize: 14, fontWeight: 800, color: '#ff4757', letterSpacing: '3px' },
+  liveTime: { fontSize: 24, fontWeight: 700, color: '#ff9f43', fontVariantNumeric: 'tabular-nums', letterSpacing: '2px', marginLeft: 'auto' },
+  bigStopBtn: { display: 'flex', alignItems: 'center', gap: 8, padding: '10px 22px', borderRadius: 10, background: '#ff4757', border: 'none', color: '#fff', fontSize: 13, fontWeight: 700, cursor: 'pointer', boxShadow: '0 4px 16px #ff475766' },
+  liveCounts: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 8 },
+  countValueId: { fontSize: 11, fontWeight: 700, color: '#bbb', fontFamily: 'monospace' },
+
+  actionZone: { background: '#111118', border: '1px solid #1e1e2a', borderRadius: 12, padding: 20 },
+  actionHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 16, marginBottom: 16, flexWrap: 'wrap' },
+  actionTitle: { fontSize: 16, fontWeight: 700, color: '#e0e0e6', marginBottom: 4 },
+  actionSub: { fontSize: 11, color: '#666', maxWidth: 480 },
+  bigRecordBtn: (disabled) => ({
+    display: 'flex', alignItems: 'center', gap: 10,
+    padding: '12px 24px', borderRadius: 10,
+    background: disabled ? '#1a1a24' : '#00d26a',
+    border: 'none', color: disabled ? '#444' : '#0a0a0f',
+    fontSize: 13, fontWeight: 800, cursor: disabled ? 'not-allowed' : 'pointer',
+    boxShadow: disabled ? 'none' : '0 4px 16px #00d26a44',
+    whiteSpace: 'nowrap', letterSpacing: '0.3px',
+  }),
+  bigRecordDot: { width: 10, height: 10, borderRadius: '50%', background: 'currentColor' },
+  disclosureHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%', background: 'none', border: 'none', padding: 0, color: '#e0e0e6', cursor: 'pointer' },
+  disclosureMeta: { display: 'flex', alignItems: 'center', gap: 10 },
+  disclosureCaret: { fontSize: 14, color: '#666' },
+
+  okBanner: { position: 'relative', padding: '10px 32px 10px 14px', background: '#00d26a12', border: '1px solid #00d26a44', borderRadius: 10, color: '#00d26a', fontSize: 12 },
+  warnBanner: { position: 'relative', padding: '10px 32px 10px 14px', background: '#ff9f4312', border: '1px solid #ff9f4344', borderRadius: 10, color: '#ff9f43', fontSize: 12 },
+  dismissBtn: { position: 'absolute', top: 6, right: 8, background: 'none', border: 'none', color: 'inherit', fontSize: 16, cursor: 'pointer' },
 };
