@@ -1,0 +1,25 @@
+{
+  "name": "ros-agrotech-app",
+  "version": "2.0.0-alpha.0",
+  "private": true,
+  "description": "AgroTech client + tooling repo. The recording engine lives in adalabs-ai/devices-hub (workspaces/field_capture_v2).",
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace apps/debug-web",
+    "build": "npm run build --workspace apps/debug-web",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "eslint . --max-warnings=0",
+    "codegen": "npm run codegen --workspace apps/debug-web"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.13.0",
+    "eslint": "^9.13.0",
+    "eslint-plugin-react-hooks": "^5.0.0",
+    "typescript-eslint": "^8.12.0"
+  }
+}

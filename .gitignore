@@ -1,10 +1,39 @@
+# Dependencies
 node_modules/
+**/node_modules/
+
+# Build output
+**/dist/
+**/build/
+**/.next/
+**/.turbo/
+**/.vite/
 log/
 install/
-build/
+
+# Editor / OS
+.DS_Store
 .kiro/
-ros2-react-app/package-lock.json
+.vscode/
+.idea/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Python caches (legacy scripts/ folder)
 __pycache__/
 *.pyc
-.env
+
+# Logs
+*.log
+npm-debug.log*
+
+# Recordings (large, device-local)
 recordings/
+
+# Legacy app caches
+jetson-app/.cache/
+ros2-react-app/.cache/
+archive/ros2-react-app/package-lock.json
