@@ -54,9 +54,12 @@ const ImageStream = ({ ros, topic, label, fullscreen }) => {
   );
 };
 
-export const JetsonView = ({ ros, connected, jetsonHost, domainId }) => {
-  const [tab, setTab] = useState('setup');
+export const JetsonView = ({ ros, connected, jetsonHost, domainId, tab: tabProp, onTabChange, rec, identity }) => {
+  const [tabUncontrolled, setTabUncontrolled] = useState('setup');
+  const tab = tabProp !== undefined ? tabProp : tabUncontrolled;
+  const setTab = onTabChange || setTabUncontrolled;
   const [showPreview, setShowPreview] = useState(false);
+  const [showUndistorted, setShowUndistorted] = useState(false);
   const [fullscreen, setFullscreen] = useState(null); // { topic, label }
 
   return (
@@ -75,13 +78,21 @@ export const JetsonView = ({ ros, connected, jetsonHost, domainId }) => {
         {TABS.map(t => (
           <button key={t.id} style={st.tab(tab === t.id)} onClick={() => setTab(t.id)}>
             {t.label}
+            {t.id === 'recording' && rec?.active && <span style={st.tabRecBadge} />}
           </button>
         ))}
         <div style={st.tabSpacer} />
         {connected && (
-          <button style={st.previewToggle(showPreview)} onClick={() => setShowPreview(!showPreview)}>
-            {showPreview ? '👁 Hide Cameras' : '👁 Show Cameras'}
-          </button>
+          <>
+            {showPreview && (
+              <button style={st.previewToggle(showUndistorted)} onClick={() => setShowUndistorted(!showUndistorted)} title="Subscribe to undistorted topic — extra bandwidth">
+                {showUndistorted ? '✓ Undist on' : '+ Undist'}
+              </button>
+            )}
+            <button style={st.previewToggle(showPreview)} onClick={() => setShowPreview(!showPreview)}>
+              {showPreview ? '👁 Hide Cameras' : '👁 Show Cameras'}
+            </button>
+          </>
         )}
       </div>
 
@@ -93,9 +104,11 @@ export const JetsonView = ({ ros, connected, jetsonHost, domainId }) => {
               <div onClick={() => setFullscreen({ topic: `/jetson/${cam}/image_raw/compressed`, label: `${cam} Raw` })} style={{ cursor: 'pointer', flex: 1 }}>
                 <ImageStream ros={ros} topic={`/jetson/${cam}/image_raw/compressed`} label={`${cam} Raw`} />
               </div>
-              <div onClick={() => setFullscreen({ topic: `/jetson/${cam}/image_undistorted/compressed`, label: `${cam} Undist` })} style={{ cursor: 'pointer', flex: 1 }}>
-                <ImageStream ros={ros} topic={`/jetson/${cam}/image_undistorted/compressed`} label={`${cam} Undist`} />
-              </div>
+              {showUndistorted && (
+                <div onClick={() => setFullscreen({ topic: `/jetson/${cam}/image_undistorted/compressed`, label: `${cam} Undist` })} style={{ cursor: 'pointer', flex: 1 }}>
+                  <ImageStream ros={ros} topic={`/jetson/${cam}/image_undistorted/compressed`} label={`${cam} Undist`} />
+                </div>
+              )}
             </div>
           ))}
         </div>
@@ -104,8 +117,8 @@ export const JetsonView = ({ ros, connected, jetsonHost, domainId }) => {
       {/* Tab content */}
       <div style={st.content}>
         {tab === 'setup' && <JetsonSetup jetsonHost={jetsonHost} connected={connected} domainId={domainId} />}
-        {tab === 'recording' && <JetsonRecording jetsonHost={jetsonHost} connected={connected} ros={ros} domainId={domainId} />}
-        {tab === 'recordings' && <RecordingsView jetsonHost={jetsonHost} domainId={domainId} />}
+        {tab === 'recording' && <JetsonRecording jetsonHost={jetsonHost} connected={connected} ros={ros} domainId={domainId} rec={rec} identity={identity} />}
+        {tab === 'recordings' && <RecordingsView jetsonHost={jetsonHost} domainId={domainId} rec={rec} />}
         {tab === 'monitor' && <JetsonMonitor jetsonHost={jetsonHost} connected={connected} />}
         {tab === 'upload' && <JetsonUpload jetsonHost={jetsonHost} />}
       </div>
@@ -144,6 +157,7 @@ const st = {
     transition: 'all 0.15s',
   }),
   tabSpacer: { flex: 1 },
+  tabRecBadge: { display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: '#ff4757', marginLeft: 8, boxShadow: '0 0 6px #ff475788', verticalAlign: 'middle' },
   previewToggle: (on) => ({
     padding: '6px 12px', borderRadius: 8, fontSize: 11, fontWeight: 600, cursor: 'pointer',
     background: on ? '#6c5ce712' : '#1a1a24',

@@ -1,8 +1,10 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import ROSLIB from 'roslib';
 import { rosEnv } from '../rosEnv';
+import { apiServicesRestart } from '../apiSsh';
+import { logEvent } from '../hooks/useEventLogger';
 
-const SSH_URL = 'http://localhost:4500';
+const SSH_URL = '';
 const sshExec = async (host, cmd, domainId) => {
   const r = await fetch(`${SSH_URL}/ssh/exec`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -18,7 +20,7 @@ const CalibStream = ({ ros, topic, label, done, calibrating }) => {
 
   useEffect(() => {
     if (!ros || done) return;
-    const sub = new ROSLIB.Topic({ ros, name: topic, messageType: 'sensor_msgs/CompressedImage' });
+    const sub = new ROSLIB.Topic({ ros, name: topic, messageType: 'sensor_msgs/CompressedImage', throttle_rate: 200, queue_size: 1 });
     sub.subscribe((msg) => {
       const raw = atob(msg.data);
       const arr = new Uint8Array(raw.length);
@@ -128,19 +130,55 @@ export const CalibrationPanel = ({ jetsonHost, onProfileActivated, domainId }) =
     await loadProfiles();
   };
 
+  // The IMX477 cameras can only be opened by one process at a time. agrotech-camera
+  // (the recording service) holds them — we must stop it for the duration of calibration.
+  const cameraServiceWasStopped = useRef(false);
+
+  const ensureCameraServiceStopped = async () => {
+    try {
+      const r = await apiServicesRestart('agrotech-camera', 'stop', jetsonHost);
+      cameraServiceWasStopped.current = true;
+      logEvent('info', 'calibration.camera_service.stopped', { ok: r.ok }, { host: jetsonHost });
+      await new Promise(res => setTimeout(res, 1500));
+    } catch (e) {
+      logEvent('warn', 'calibration.camera_service.stop_failed', { error: e.message }, { host: jetsonHost });
+    }
+  };
+
+  const restoreCameraService = async () => {
+    if (!cameraServiceWasStopped.current) return;
+    cameraServiceWasStopped.current = false;
+    try {
+      await apiServicesRestart('agrotech-camera', 'start', jetsonHost);
+      logEvent('info', 'calibration.camera_service.restored', {}, { host: jetsonHost });
+    } catch (e) {
+      logEvent('error', 'calibration.camera_service.restore_failed', { error: e.message }, { host: jetsonHost });
+    }
+  };
+
   const startCalib = async () => {
     if (!profileName.trim()) return;
     setRunning(true); setCalibrating(false); setLogs([]); setProgress({}); setResult(null); offsetRef.current = 0;
+    setLogs([{ stage: 'info', message: 'Releasing cameras from recording service…' }]);
+    await ensureCameraServiceStopped();
+    setLogs((prev) => [...prev, { stage: 'info', message: 'Cameras released. Starting calibration…' }]);
     const typeFlag = camType !== 'normal' ? ` --type ${camType}` : '';
     const cmd = `python3 /home/ada/calibrate_headless.py --target ${target} --camera ${camera}${typeFlag} --profile "${profileName}" --description "${description}"`;
+    logEvent('info', 'calibration.start.requested', { profile: profileName, camera, target, type: camType }, { host: jetsonHost });
     try {
       const res = await fetch(`${SSH_URL}/ssh/launch`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id: 'calibration', host: jetsonHost, user: 'ada', password: 'ada123',
-          command: `${rosEnv(domainId)} && ${cmd} 2>/dev/null` }),
+          command: `${rosEnv(domainId)} && ${cmd}` }),
       });
       const data = await res.json();
-      if (!data.ok) { setLogs([{ stage: 'error', message: data.error }]); setRunning(false); return; }
+      if (!data.ok) {
+        setLogs([{ stage: 'error', message: data.error }]);
+        logEvent('error', 'calibration.launch_failed', { error: data.error }, { host: jetsonHost });
+        setRunning(false);
+        await restoreCameraService();
+        return;
+      }
       pollRef.current = setInterval(async () => {
         try {
           const r = await fetch(`${SSH_URL}/ssh/output`, {
@@ -160,26 +198,45 @@ export const CalibrationPanel = ({ jetsonHost, onProfileActivated, domainId }) =
               if (p.stage === 'done') setResult((prev) => ({ ...(prev || {}), [p.camera]: p }));
             });
           }
-          if (d.done) { clearInterval(pollRef.current); setRunning(false); loadProfiles(); }
+          if (d.done) {
+            clearInterval(pollRef.current);
+            setRunning(false);
+            await restoreCameraService();
+            loadProfiles();
+            logEvent('info', 'calibration.finished', { profile: profileName }, { host: jetsonHost });
+          }
         } catch {}
       }, 500);
-    } catch (e) { setLogs([{ stage: 'error', message: e.message }]); setRunning(false); }
+    } catch (e) {
+      setLogs([{ stage: 'error', message: e.message }]);
+      logEvent('error', 'calibration.exception', { error: e.message }, { host: jetsonHost });
+      setRunning(false);
+      await restoreCameraService();
+    }
   };
 
   const stopCalib = async () => {
     clearInterval(pollRef.current);
-    try { await fetch(`${SSH_URL}/ssh/stop`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: 'calibration' }) }); } catch {}
+    try { await fetch(`${SSH_URL}/ssh/stop`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: 'calibration', host: jetsonHost, user: 'ada', password: 'ada123' }) }); } catch {}
     setRunning(false);
     setLogs((prev) => [...prev, { stage: 'info', message: 'Cancelled — previous calibration preserved.' }]);
+    await restoreCameraService();
+    logEvent('info', 'calibration.cancelled', { profile: profileName }, { host: jetsonHost });
   };
 
-  // Cleanup on unmount: stop polling AND kill calibration process if still running
+  // Cleanup on unmount: stop polling, kill calibration process, restore camera service.
   const runningRef = useRef(false);
   runningRef.current = running;
+  const hostRef = useRef(jetsonHost);
+  hostRef.current = jetsonHost;
   useEffect(() => () => {
     clearInterval(pollRef.current);
     if (runningRef.current) {
-      fetch(`${SSH_URL}/ssh/stop`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: 'calibration' }) }).catch(() => {});
+      fetch(`${SSH_URL}/ssh/stop`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: 'calibration', host: hostRef.current, user: 'ada', password: 'ada123' }) }).catch(() => {});
+    }
+    if (cameraServiceWasStopped.current) {
+      apiServicesRestart('agrotech-camera', 'start', hostRef.current).catch(() => {});
+      cameraServiceWasStopped.current = false;
     }
   }, []);
 

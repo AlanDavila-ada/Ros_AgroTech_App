@@ -1,0 +1,18 @@
+[Unit]
+Description=AgroTech rosbridge_websocket (port 9090)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ada
+WorkingDirectory=/home/ada
+Environment=ROS_DOMAIN_ID=42
+Environment=RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+Environment=CYCLONEDDS_URI=file:///home/ada/cyclonedds.xml
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && source /home/ada/ros2_ws/install/setup.bash 2>/dev/null; exec ros2 launch rosbridge_server rosbridge_websocket_launch.xml'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

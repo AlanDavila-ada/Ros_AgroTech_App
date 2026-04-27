@@ -1,0 +1,18 @@
+[Unit]
+Description=AgroTech BNO080 IMU node
+After=agrotech-rosbridge.service
+Requires=agrotech-rosbridge.service
+
+[Service]
+Type=simple
+User=ada
+WorkingDirectory=/home/ada
+Environment=ROS_DOMAIN_ID=42
+Environment=RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+Environment=CYCLONEDDS_URI=file:///home/ada/cyclonedds.xml
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && source /home/ada/ros2_ws/install/setup.bash 2>/dev/null; exec ros2 run bno080_imu bno080_node'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

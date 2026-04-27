@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import ROSLIB from 'roslib';
-import { apiExec, apiLaunch, apiStop, apiOutput, rosEnv } from '../api';
+import { apiExec, apiLaunch, apiStop, apiOutput, apiServicesRestart, rosEnv } from '../api';
+import { logEvent } from '../hooks/useEventLogger';
 const sshExec = (host, cmd, domainId) => apiExec(`${rosEnv(domainId)} && ${cmd}`, host);
 
 /* ── Single camera stream (same pattern as JetsonView's ImageStream) ── */
@@ -120,14 +121,53 @@ export const CalibrationPanel = ({ jetsonHost, onProfileActivated, domainId }) =
     await loadProfiles();
   };
 
+  // The IMX477 cameras can only be opened by one process at a time. The recording
+  // service (agrotech-camera) holds them by default, so we must stop it for the
+  // duration of calibration and bring it back up afterward.
+  const cameraServiceWasStopped = useRef(false);
+
+  const ensureCameraServiceStopped = async () => {
+    try {
+      const r = await apiServicesRestart('agrotech-camera', 'stop', jetsonHost);
+      cameraServiceWasStopped.current = true;
+      logEvent('info', 'calibration.camera_service.stopped', { ok: r.ok }, { host: jetsonHost });
+      // Argus needs ~1.5s to fully release the sensor.
+      await new Promise(res => setTimeout(res, 1500));
+    } catch (e) {
+      logEvent('warn', 'calibration.camera_service.stop_failed', { error: e.message }, { host: jetsonHost });
+    }
+  };
+
+  const restoreCameraService = async () => {
+    if (!cameraServiceWasStopped.current) return;
+    cameraServiceWasStopped.current = false;
+    try {
+      await apiServicesRestart('agrotech-camera', 'start', jetsonHost);
+      logEvent('info', 'calibration.camera_service.restored', {}, { host: jetsonHost });
+    } catch (e) {
+      logEvent('error', 'calibration.camera_service.restore_failed', { error: e.message }, { host: jetsonHost });
+    }
+  };
+
   const startCalib = async () => {
     if (!profileName.trim()) return;
     setRunning(true); setCalibrating(false); setLogs([]); setProgress({}); setResult(null); offsetRef.current = 0;
+    setLogs([{ stage: 'info', message: 'Releasing cameras from recording service…' }]);
+    await ensureCameraServiceStopped();
+    setLogs((prev) => [...prev, { stage: 'info', message: 'Cameras released. Starting calibration…' }]);
     const typeFlag = camType !== 'normal' ? ` --type ${camType}` : '';
     const cmd = `python3 /home/ada/calibrate_headless.py --target ${target} --camera ${camera}${typeFlag} --profile "${profileName}" --description "${description}"`;
+    logEvent('info', 'calibration.start.requested', { profile: profileName, camera, target, type: camType }, { host: jetsonHost });
     try {
-      const data = await apiLaunch('calibration', `${rosEnv(domainId)} && ${cmd} 2>/dev/null`, jetsonHost);
-      if (!data.ok) { setLogs([{ stage: 'error', message: data.error }]); setRunning(false); return; }
+      // Keep stderr (no `2>/dev/null`) — we want to see Argus failures.
+      const data = await apiLaunch('calibration', `${rosEnv(domainId)} && ${cmd}`, jetsonHost);
+      if (!data.ok) {
+        setLogs([{ stage: 'error', message: data.error }]);
+        logEvent('error', 'calibration.launch_failed', { error: data.error }, { host: jetsonHost });
+        setRunning(false);
+        await restoreCameraService();
+        return;
+      }
       pollRef.current = setInterval(async () => {
         try {
           const d = await apiOutput('calibration', offsetRef.current);
@@ -143,26 +183,45 @@ export const CalibrationPanel = ({ jetsonHost, onProfileActivated, domainId }) =
               if (p.stage === 'done') setResult((prev) => ({ ...(prev || {}), [p.camera]: p }));
             });
           }
-          if (d.done) { clearInterval(pollRef.current); setRunning(false); loadProfiles(); }
+          if (d.done) {
+            clearInterval(pollRef.current);
+            setRunning(false);
+            await restoreCameraService();
+            loadProfiles();
+            logEvent('info', 'calibration.finished', { profile: profileName }, { host: jetsonHost });
+          }
         } catch {}
       }, 500);
-    } catch (e) { setLogs([{ stage: 'error', message: e.message }]); setRunning(false); }
+    } catch (e) {
+      setLogs([{ stage: 'error', message: e.message }]);
+      logEvent('error', 'calibration.exception', { error: e.message }, { host: jetsonHost });
+      setRunning(false);
+      await restoreCameraService();
+    }
   };
 
   const stopCalib = async () => {
     clearInterval(pollRef.current);
-    try { await apiStop('calibration'); } catch {}
+    try { await apiStop('calibration', jetsonHost); } catch {}
     setRunning(false);
     setLogs((prev) => [...prev, { stage: 'info', message: 'Cancelled — previous calibration preserved.' }]);
+    await restoreCameraService();
+    logEvent('info', 'calibration.cancelled', { profile: profileName }, { host: jetsonHost });
   };
 
-  // Cleanup on unmount: stop polling AND kill calibration process if still running
+  // Cleanup on unmount: stop polling, kill calibration process, restore camera service.
   const runningRef = useRef(false);
   runningRef.current = running;
+  const hostRef = useRef(jetsonHost);
+  hostRef.current = jetsonHost;
   useEffect(() => () => {
     clearInterval(pollRef.current);
     if (runningRef.current) {
-      apiStop('calibration').catch(() => {});
+      apiStop('calibration', hostRef.current).catch(() => {});
+    }
+    if (cameraServiceWasStopped.current) {
+      apiServicesRestart('agrotech-camera', 'start', hostRef.current).catch(() => {});
+      cameraServiceWasStopped.current = false;
     }
   }, []);
 

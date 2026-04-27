@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import ROSLIB from 'roslib';
 import { rosEnv } from '../rosEnv';
 
-const SSH_URL = 'http://localhost:4500';
+const SSH_URL = '';
 const sshExec = async (host, cmd) => {
   const r = await fetch(`${SSH_URL}/ssh/exec`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -133,7 +133,7 @@ scan(base,[])
 print(json.dumps(out))
 "`;
 
-export const RecordingsView = ({ jetsonHost, domainId }) => {
+export const RecordingsView = ({ jetsonHost, domainId, rec }) => {
   const [recordings, setRecordings] = useState([]);
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState(null);
@@ -143,21 +143,45 @@ export const RecordingsView = ({ jetsonHost, domainId }) => {
   const [expanded, setExpanded] = useState(null);
   const [fileTree, setFileTree] = useState(null);
   const [fileTreeLoading, setFileTreeLoading] = useState(false);
+  const [highlightKey, setHighlightKey] = useState(null);
   const pollRef = useRef(null);
   const offsetRef = useRef(0);
+  const prevActiveRef = useRef(false);
 
   const loadRecordings = useCallback(async () => {
     setLoading(true);
     try {
       const d = await sshExec(jetsonHost, SCAN_SCRIPT);
       if (d.ok && d.output) {
-        try { setRecordings(JSON.parse(d.output.trim())); } catch {}
+        try {
+          const parsed = JSON.parse(d.output.trim());
+          parsed.sort((a, b) => (b.meta?.start_time || '').localeCompare(a.meta?.start_time || ''));
+          setRecordings(parsed);
+        } catch {}
       }
     } catch {}
     setLoading(false);
   }, [jetsonHost]);
 
   useEffect(() => { loadRecordings(); }, [loadRecordings]);
+
+  useEffect(() => {
+    const wasActive = prevActiveRef.current;
+    const isActive = !!rec?.active;
+    prevActiveRef.current = isActive;
+    if (wasActive && !isActive) {
+      const ids = rec?.lastIds;
+      const justFinished = ids ? `${ids.customer}/${ids.device}/${ids.patrol}/${ids.recording}` : null;
+      const t = setTimeout(async () => {
+        await loadRecordings();
+        if (justFinished) {
+          setHighlightKey(justFinished);
+          setTimeout(() => setHighlightKey(null), 5000);
+        }
+      }, 1500);
+      return () => clearTimeout(t);
+    }
+  }, [rec?.active, rec?.lastIds, loadRecordings]);
 
   const recPath = (rec) => rec.company
     ? `${rec.company}/${rec.device}/${rec.patrol}/${rec.recording}`
@@ -260,12 +284,14 @@ print(json.dumps(tree))
 
   useEffect(() => () => clearInterval(pollRef.current), []);
 
-  // Group recordings by company/device
+  const shortId = (id) => !id ? '' : (id.length > 12 ? `${id.slice(0, 8)}…` : id);
   const grouped = {};
-  recordings.forEach((rec) => {
-    const group = rec.company ? `${rec.company} / ${rec.device}` : 'Legacy';
+  recordings.forEach((r) => {
+    const group = r.company
+      ? `Customer ${shortId(r.company)} · Device ${shortId(r.device)}`
+      : 'Legacy';
     if (!grouped[group]) grouped[group] = [];
-    grouped[group].push(rec);
+    grouped[group].push(r);
   });
 
   return (
@@ -288,11 +314,13 @@ print(json.dumps(tree))
               const totalFrames = Object.values(m.topics || {}).reduce((a, t) => a + (t.frames || 0), 0);
               const hasCamerasMcap = fileTree && expanded === key && fileTree.some(f => f.path === 'cameras.mcap');
               return (
-                <div key={key} style={{ ...st.recCard, borderColor: active ? '#6c5ce7' : '#1e1e2a' }}>
+                <div key={key} style={{ ...st.recCard, borderColor: highlightKey === key ? '#00d26a' : (active ? '#6c5ce7' : '#1e1e2a'), boxShadow: highlightKey === key ? '0 0 16px #00d26a44' : 'none', transition: 'all 0.3s' }}>
+                  {highlightKey === key && <div style={st.newBadge}>● JUST FINISHED</div>}
                   <div style={st.recHeader}>
-                    <div>
-                      <div style={st.recTitle}>{rec.patrol} / {rec.recording}</div>
+                    <div style={{ minWidth: 0, flex: 1 }}>
+                      <div style={st.recTitle} title={`${rec.patrol} / ${rec.recording}`}>{shortId(rec.patrol)} / {shortId(rec.recording)}</div>
                       <div style={st.recMeta}>{m.start_time} — {m.duration_sec}s — {totalFrames} frames</div>
+                      {m.comment && <div style={st.recComment}>💬 {m.comment}</div>}
                     </div>
                     <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
                       <button style={st.browseBtn} onClick={() => loadFileTree(rec)}>
@@ -378,7 +406,9 @@ const st = {
   empty: { padding: 40, textAlign: 'center', color: '#555', fontSize: 13 },
   groupHeader: { fontSize: 12, fontWeight: 700, color: '#6c5ce7', letterSpacing: '0.5px', padding: '8px 0 4px', borderBottom: '1px solid #1e1e2a', marginBottom: 8 },
   list: { display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 16 },
-  recCard: { background: '#111118', border: '1px solid #1e1e2a', borderRadius: 12, padding: 14 },
+  recCard: { background: '#111118', border: '1px solid #1e1e2a', borderRadius: 12, padding: 14, position: 'relative' },
+  newBadge: { position: 'absolute', top: -8, right: 12, padding: '2px 10px', background: '#00d26a', color: '#0a0a0f', fontSize: 9, fontWeight: 800, letterSpacing: '1px', borderRadius: 4 },
+  recComment: { marginTop: 4, fontSize: 11, color: '#aaa', fontStyle: 'italic' },
   recHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' },
   recTitle: { fontSize: 14, fontWeight: 700, color: '#e0e0e6' },
   recMeta: { fontSize: 11, color: '#666', marginTop: 2 },
